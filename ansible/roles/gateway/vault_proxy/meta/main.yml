@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  author: infrashift
+  description: Vault Proxy on a unix socket only Envoy can open (AppRole auto-auth), on the Linux x86_64 host
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - vault
+    - envoy
+    - linux
+
+dependencies: []
+...

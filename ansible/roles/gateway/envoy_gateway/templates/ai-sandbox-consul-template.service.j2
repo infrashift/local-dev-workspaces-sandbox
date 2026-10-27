@@ -1,0 +1,53 @@
+# {{ ansible_managed }}
+[Unit]
+Description=consul-template: the ai-sandbox egress allow list -> Envoy's CONNECT routes
+After=network-online.target consul.service
+Wants=network-online.target consul.service
+
+[Service]
+# Its own user: it holds a Consul token and talks to Consul, and must not
+# reach what Envoy can (Vault Proxy's socket, the gateway key). It writes
+# the route table into a setgid {{ envoy_gateway_user }} directory, which Envoy only reads.
+User={{ envoy_gateway_ct_user }}
+Group={{ envoy_gateway_ct_user }}
+# Opens Consul's socket.
+SupplementaryGroups={{ envoy_gateway_consul_group }}
+ExecStart={{ envoy_gateway_consul_template_bin }} -config={{ envoy_gateway_ct_config }}
+ExecReload=/bin/kill --signal HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+# Sandboxing: systemd-analyze security scores it, and the role asserts that score.
+ProtectSystem=strict
+ReadWritePaths={{ envoy_gateway_rds_dir }}
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+KeyringMode=private
+DevicePolicy=closed
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0027
+MemoryDenyWriteExecute=yes
+# Consul's socket only.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

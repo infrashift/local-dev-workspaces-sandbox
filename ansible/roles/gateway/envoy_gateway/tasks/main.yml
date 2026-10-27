@@ -1,0 +1,433 @@
+---
+# Envoy as the zero-trust gateway, and the consul-template that keeps its
+# CONNECT route table equal to the egress allow list in Consul K/V
+# (concepts/Zero-Trust Surrogate Gateway). Envoy runs as envoy, which alone
+# can open Vault Proxy's socket and read the gateway key; consul-template as
+# consul-template, which alone holds the Consul read token and writes the
+# route table Envoy reads.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - envoy_gateway_bin is defined and envoy_gateway_bin is match('^/[^ ]+$')
+      - envoy_gateway_consul_template_bin is defined and envoy_gateway_consul_template_bin is match('^/[^ ]+$')
+      - envoy_gateway_listen_ip is defined and envoy_gateway_listen_ip is match('^(\d{1,3}\.){3}\d{1,3}$')
+      # Never every address: the gateway serves the sandbox network only.
+      - envoy_gateway_listen_ip not in ['0.0.0.0', '127.0.0.1']
+      - envoy_gateway_sandbox_cidr is defined and envoy_gateway_sandbox_cidr is match('^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$')
+      - envoy_gateway_proxy_port is defined and envoy_gateway_proxy_port | int > 0
+      - envoy_gateway_gateway_port is defined and envoy_gateway_gateway_port | int > 0
+      - envoy_gateway_routes is defined and envoy_gateway_routes is sequence and envoy_gateway_routes is not string
+      - envoy_gateway_routes | length > 0
+      - envoy_gateway_routes | rejectattr('upstream.ca', 'in', ['system', 'upstream']) | list | length == 0
+      - envoy_gateway_pki_dir is defined and envoy_gateway_pki_dir is match('^/[^ ]+$')
+      - envoy_gateway_vault_socket is defined and envoy_gateway_vault_socket is match('^/[^ ]+\.sock$')
+      - envoy_gateway_consul_socket is defined and envoy_gateway_consul_socket is match('^/[^ ]+\.sock$')
+      - envoy_gateway_consul_group is defined and envoy_gateway_consul_group is match('^[a-z][a-z0-9_-]*$')
+      - envoy_gateway_consul_token_file is defined and envoy_gateway_consul_token_file is match('^/[^ ]+$')
+      - envoy_gateway_tls_inspection_dir is defined and envoy_gateway_tls_inspection_dir is match('^/[^ ]+$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        envoy_gateway_bin                  absolute path to envoy (envoy_release)
+        envoy_gateway_consul_template_bin  absolute path to consul-template (hashicorp_release)
+        envoy_gateway_listen_ip            the host's address on the sandbox network (GATEWAY_IP)
+        envoy_gateway_sandbox_cidr         the sandbox network (SANDBOX_CIDR): the only sources served
+        envoy_gateway_proxy_port           the CONNECT tunnel's port (PROXY_PORT)
+        envoy_gateway_gateway_port         the TLS gateway's port (GATEWAY_PORT)
+        envoy_gateway_routes               vars/gateway.yml gateway_routes (upstream.ca: system or upstream)
+        envoy_gateway_pki_dir              gateway_pki's directory (gateway.pem/.key, upstream-ca.pem)
+        envoy_gateway_vault_socket         Vault Proxy's unix socket
+        envoy_gateway_consul_socket        consul_server's unix socket (its HTTP API)
+        envoy_gateway_consul_group         the group that opens it (consul_server's socket group)
+        envoy_gateway_consul_token_file    consul-template's read token (consul_egress)
+        envoy_gateway_tls_inspection_dir   absolute directory of a TLS-inspecting proxy's CA chain
+                                           (*.pem / *.crt; TLS_INSPECTION_DIR); empty or missing
+                                           when there is no such proxy
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      tunnel {{ envoy_gateway_listen_ip }}:{{ envoy_gateway_proxy_port }}, gateway
+      {{ envoy_gateway_listen_ip }}:{{ envoy_gateway_gateway_port }} for
+      {{ envoy_gateway_routes | map(attribute='host') | join(', ') }}
+
+# ---------------------------------------------------------------------------
+# THE TLS-INSPECTION CHAIN (optional). Behind a TLS-inspecting proxy such as
+# Zscaler, every public upstream presents a certificate the proxy re-signed,
+# so Envoy verifies those routes (ca: system) with the host's public roots
+# PLUS the proxy's chain: roots alone fail every handshake, and the chain
+# alone fails every site the proxy does not inspect. No chain: the host's
+# public roots alone, as before. See concepts/Corporate TLS Interception.
+# ---------------------------------------------------------------------------
+- name: Find the TLS-inspection chain in {{ envoy_gateway_tls_inspection_dir }}
+  ansible.builtin.set_fact:
+    envoy_gateway_inspection_files: >-
+      {{ (query('ansible.builtin.fileglob', envoy_gateway_tls_inspection_dir ~ '/*.pem')
+          + query('ansible.builtin.fileglob', envoy_gateway_tls_inspection_dir ~ '/*.crt')) | sort }}
+
+- name: Split the chain into PEM objects
+  ansible.builtin.set_fact:
+    # Double-quoted: YAML turns \n into a newline (a folded scalar would not).
+    envoy_gateway_inspection_pems: "{{ (query('ansible.builtin.file', *envoy_gateway_inspection_files)
+      | join('\n') | community.crypto.split_pem) if envoy_gateway_inspection_files | length > 0 else [] }}"
+
+# Never loop over a private key: a failed loop item is printed whole. Only
+# the PEM headers are reported here.
+- name: Assert that the chain holds only certificates
+  ansible.builtin.assert:
+    that: envoy_gateway_inspection_pems | reject('match', '^-----BEGIN CERTIFICATE-----') | list | length == 0
+    fail_msg: >-
+      {{ envoy_gateway_inspection_files | join(', ') }} must hold only the proxy's CA certificates; found
+      {{ envoy_gateway_inspection_pems | map('regex_search', '^-----BEGIN [A-Z0-9 ]+-----') | list }}.
+      Remove any private key from {{ envoy_gateway_tls_inspection_dir }}.
+    quiet: true
+
+- name: Assert that every certificate is an unexpired CA
+  ansible.builtin.assert:
+    that:
+      - not (item | community.crypto.x509_certificate_info).expired
+      - "'CA:TRUE' in ((item | community.crypto.x509_certificate_info).basic_constraints or [])"
+    fail_msg: >-
+      Certificate {{ envoy_gateway_inspection_idx + 1 }} in {{ envoy_gateway_inspection_files | join(', ') }}
+      is not an unexpired CA certificate (a leaf, or an expired CA). Only the proxy's current CA chain
+      belongs in {{ envoy_gateway_tls_inspection_dir }}.
+    success_msg: >-
+      {{ (item | community.crypto.x509_certificate_info).subject_ordered | map('join', '=') | join(', ') }}
+      (until {{ (item | community.crypto.x509_certificate_info).not_after }})
+  loop: "{{ envoy_gateway_inspection_pems }}"
+  loop_control:
+    index_var: envoy_gateway_inspection_idx
+    label: "certificate {{ envoy_gateway_inspection_idx + 1 }}"
+
+- name: Read the host's public CA bundle
+  ansible.builtin.slurp:
+    src: "{{ envoy_gateway_host_ca_bundle }}"
+  register: envoy_gateway_host_bundle
+  when: envoy_gateway_inspecting
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Configure Envoy and consul-template
+  become: true
+  block:
+    - name: Create the envoy system user (its group opens Vault Proxy's socket)
+      ansible.builtin.user:
+        name: "{{ envoy_gateway_user }}"
+        group: "{{ envoy_gateway_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: /var/lib/envoy
+        create_home: false
+
+    # Its group exists already: consul_egress made it for the Consul token.
+    - name: Create the consul-template system user
+      ansible.builtin.user:
+        name: "{{ envoy_gateway_ct_user }}"
+        group: "{{ envoy_gateway_ct_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: /nonexistent
+        create_home: false
+      register: envoy_gateway_ct_account
+
+    # A dry run does not create the user, so nothing can be given to it yet.
+    - name: Decide whether the consul-template user exists in this pass
+      ansible.builtin.set_fact:
+        envoy_gateway_ct_pending: "{{ ansible_check_mode and envoy_gateway_ct_account is changed }}"
+
+    # The route table's directory is consul-template's to write and setgid
+    # envoy, so what it renders is Envoy's to read and nobody else's.
+    - name: Create the Envoy and consul-template directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ envoy_gateway_config_dir }}", owner: root, group: "{{ envoy_gateway_user }}", mode: "0750" }
+        - { path: "{{ envoy_gateway_ct_dir }}", owner: root, group: "{{ envoy_gateway_ct_user }}", mode: "0750" }
+        - { path: /var/lib/envoy, owner: "{{ envoy_gateway_user }}", group: "{{ envoy_gateway_user }}", mode: "0755" }
+        - path: "{{ envoy_gateway_rds_dir }}"
+          owner: "{{ envoy_gateway_ct_user }}"
+          group: "{{ envoy_gateway_user }}"
+          mode: "2750"
+      loop_control:
+        label: "{{ item.path }}"
+      when: not (envoy_gateway_ct_pending and envoy_gateway_ct_user in [item.owner, item.group])
+
+    # Public certificates only, so world-readable: the gateway suite checks
+    # it as the operator. Envoy reads it only at start, hence the restart.
+    - name: Create the TLS-inspection bundle's directory
+      ansible.builtin.file:
+        path: "{{ envoy_gateway_inspection_bundle | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: envoy_gateway_inspecting
+
+    - name: Write the public-upstream CA bundle (the host's roots, then the TLS-inspection chain)
+      ansible.builtin.copy:
+        content: "{{ (envoy_gateway_host_bundle.content | b64decode | trim) ~ '\n'
+          ~ (envoy_gateway_inspection_pems | map('trim') | join('\n')) ~ '\n' }}"
+        dest: "{{ envoy_gateway_inspection_bundle }}"
+        owner: root
+        group: root
+        mode: "0644"
+      when: envoy_gateway_inspecting
+      notify: envoy_gateway restart envoy
+
+    - name: Remove the public-upstream CA bundle (no TLS-inspection chain)
+      ansible.builtin.file:
+        path: "{{ envoy_gateway_inspection_bundle | dirname }}"
+        state: absent
+      when: not envoy_gateway_inspecting
+
+    # Envoy reads its certificate only at start; its digest in envoy.yaml
+    # makes a re-issued certificate restart Envoy.
+    - name: Read the gateway certificate
+      ansible.builtin.slurp:
+        src: "{{ envoy_gateway_cert }}"
+      register: envoy_gateway_cert_pem
+      failed_when: envoy_gateway_cert_pem is failed and not ansible_check_mode
+
+    - name: Write the surrogate Lua filter
+      ansible.builtin.template:
+        src: surrogate.lua.j2
+        dest: "{{ envoy_gateway_lua }}"
+        owner: root
+        group: "{{ envoy_gateway_user }}"
+        mode: "0640"
+      notify: envoy_gateway restart envoy
+
+    - name: Write the route template and consul-template's configuration
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: "{{ envoy_gateway_ct_user }}"
+        mode: "0640"
+      loop:
+        - { src: connect-routes.ctmpl.j2, dest: "{{ envoy_gateway_ctmpl }}" }
+        - { src: consul-template.hcl.j2, dest: "{{ envoy_gateway_ct_config }}" }
+      loop_control:
+        label: "{{ item.dest }}"
+      notify: envoy_gateway restart consul-template
+      when: not envoy_gateway_ct_pending
+
+    - name: Remove consul-template's files from Envoy's directory
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ envoy_gateway_ct_former }}"
+
+    - name: Write Envoy's configuration
+      ansible.builtin.template:
+        src: envoy.yaml.j2
+        dest: "{{ envoy_gateway_config }}"
+        owner: root
+        group: "{{ envoy_gateway_user }}"
+        mode: "0640"
+      vars:
+        envoy_gateway_cert_sha256: "{{ (envoy_gateway_cert_pem.content | default('') | b64decode) | hash('sha256') }}"
+      notify: envoy_gateway restart envoy
+
+    # Never overwritten: once consul-template runs, it owns this file.
+    - name: Write the deny-all route table until consul-template renders the allow list
+      ansible.builtin.template:
+        src: connect-routes.empty.yaml.j2
+        dest: "{{ envoy_gateway_rds_file }}"
+        owner: "{{ envoy_gateway_ct_user }}"
+        group: "{{ envoy_gateway_user }}"
+        mode: "0640"
+        force: false
+      when: not envoy_gateway_ct_pending
+
+    # consul-template leaves an unchanged table as it is, so one it rendered
+    # as envoy keeps that owner unless set here.
+    - name: Give the route table to consul-template, readable by Envoy
+      ansible.builtin.file:
+        path: "{{ envoy_gateway_rds_file }}"
+        owner: "{{ envoy_gateway_ct_user }}"
+        group: "{{ envoy_gateway_user }}"
+        mode: "0640"
+      when: not ansible_check_mode
+
+    - name: Install the systemd units
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ envoy_gateway_units }}"
+      loop_control:
+        label: "{{ item.dest }}"
+      notify:
+        - envoy_gateway restart envoy
+        - envoy_gateway restart consul-template
+
+# In a dry run on a fresh host the binaries and files do not exist yet; the
+# validation and the services then wait for the real run.
+- name: Stat the binaries and Envoy's configuration
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: >-
+    {{ [envoy_gateway_bin, envoy_gateway_consul_template_bin, envoy_gateway_config]
+       + (envoy_gateway_units | map(attribute='dest') | list) }}
+  register: envoy_gateway_present
+  become: true
+
+- name: Decide whether the gateway can run in this pass
+  ansible.builtin.set_fact:
+    envoy_gateway_live: >-
+      {{ not ansible_check_mode or (envoy_gateway_present.results | map(attribute='stat.exists') | min) }}
+
+- name: Validate Envoy's configuration
+  ansible.builtin.command:
+    argv: ["{{ envoy_gateway_bin }}", --mode, validate, -c, "{{ envoy_gateway_config }}", --log-level, error]
+  register: envoy_gateway_validate
+  changed_when: false
+  check_mode: false
+  become: true
+  when: envoy_gateway_live
+
+- name: Enable and start consul-template and Envoy
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop: [ai-sandbox-consul-template, envoy]
+  become: true
+  when: envoy_gateway_live
+
+- name: Apply pending restarts now
+  ansible.builtin.meta: flush_handlers
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — Envoy is live, both listeners are bound to the gateway
+# address only, the admin view the operator gets cannot change Envoy, and the
+# route table consul-template rendered is loaded.
+# ---------------------------------------------------------------------------
+# The admin socket is envoy-only: root asks it.
+- name: Wait for Envoy to be ready
+  ansible.builtin.uri:
+    url: http://localhost/ready
+    unix_socket: "{{ envoy_gateway_admin_socket }}"
+    return_content: true
+  register: envoy_gateway_ready
+  until: envoy_gateway_ready.content | default('') is search('LIVE')
+  retries: 30
+  delay: 1
+  check_mode: false
+  become: true
+  when: envoy_gateway_live and not ansible_check_mode
+
+- name: Read Envoy's listeners
+  ansible.builtin.uri:
+    url: http://localhost/listeners?format=json
+    unix_socket: "{{ envoy_gateway_admin_socket }}"
+  register: envoy_gateway_listeners
+  check_mode: false
+  become: true
+  when: envoy_gateway_live and not ansible_check_mode
+
+# The operator's view refuses whatever would change Envoy.
+- name: Ask the read-only admin view to raise the log level
+  ansible.builtin.uri:
+    url: http://localhost/logging?level=debug
+    unix_socket: "{{ envoy_gateway_admin_readonly_socket }}"
+    method: POST
+    status_code: [200, 403]
+  register: envoy_gateway_readonly_post
+  check_mode: false
+  when: envoy_gateway_live and not ansible_check_mode
+
+# The table is consul-template's and Envoy's alone.
+- name: Wait for consul-template's route table
+  ansible.builtin.wait_for:
+    path: "{{ envoy_gateway_rds_file }}"
+    search_regex: 'name: allow'
+    timeout: 60
+  become: true
+  when: envoy_gateway_live and not ansible_check_mode
+
+- name: Assert both listeners are bound to the gateway address only, and the admin view is read-only
+  ansible.builtin.assert:
+    that:
+      - envoy_gateway_tcp | map(attribute='address') | unique == [envoy_gateway_listen_ip]
+      - envoy_gateway_tcp | map(attribute='port_value') | map('int') | sort
+        == [envoy_gateway_proxy_port | int, envoy_gateway_gateway_port | int] | sort
+      - envoy_gateway_pipes == [envoy_gateway_admin_readonly_socket]
+      - envoy_gateway_readonly_post.status == 403
+    fail_msg: >-
+      Envoy listens on {{ envoy_gateway_listeners.json.listener_statuses | map(attribute='local_address') }};
+      a POST through the read-only admin view answered {{ envoy_gateway_readonly_post.status }}
+    success_msg: >-
+      {{ envoy_gateway_validate.stdout | default('') | trim }}; listening on {{ envoy_gateway_listen_ip }}:
+      {{ envoy_gateway_tcp | map(attribute='port_value') | join(', ') }}; read-only admin view on
+      {{ envoy_gateway_admin_readonly_socket }}
+  vars:
+    envoy_gateway_tcp: >-
+      {{ envoy_gateway_listeners.json.listener_statuses | map(attribute='local_address')
+         | selectattr('socket_address', 'defined') | map(attribute='socket_address') | list }}
+    envoy_gateway_pipes: >-
+      {{ envoy_gateway_listeners.json.listener_statuses | map(attribute='local_address')
+         | selectattr('pipe', 'defined') | map(attribute='pipe.path') | list }}
+  when: envoy_gateway_live and not ansible_check_mode
+
+# The units' sandboxing, scored by systemd (0 best, 10 worst); measured when
+# it was set, so a weaker unit fails here (concepts/Vault and Consul Host Trust).
+- name: Score the sandboxing of Envoy's and consul-template's units
+  ansible.builtin.command: systemd-analyze security --no-pager {{ item }}.service
+  loop: "{{ envoy_gateway_max_exposure.keys() | list }}"
+  register: envoy_gateway_security
+  changed_when: false
+  check_mode: false
+  when: envoy_gateway_live and not ansible_check_mode
+
+- name: Assert the sandboxing of Envoy's and consul-template's units has not weakened
+  ansible.builtin.assert:
+    that: envoy_gateway_score | float <= envoy_gateway_max_exposure[item.item]
+    fail_msg: >-
+      {{ item.item }}.service exposure {{ envoy_gateway_score }}, at most {{ envoy_gateway_max_exposure[item.item] }}:
+      {{ item.stdout_lines | last }}
+    success_msg: >-
+      {{ item.item }}.service exposure {{ envoy_gateway_score }}
+      (at most {{ envoy_gateway_max_exposure[item.item] }})
+  loop: "{{ envoy_gateway_security.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    envoy_gateway_score: "{{ item.stdout_lines | last | regex_search('[0-9]+[.][0-9]+') }}"
+  when: envoy_gateway_live and not ansible_check_mode
+...

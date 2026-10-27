@@ -1,0 +1,11 @@
+---
+- name: Restart the GitHub MCP server and its TLS front end
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: restarted
+    daemon_reload: true
+  loop: [ai-sandbox-github-mcp, ai-sandbox-github-mcp-tls]
+  listen: upstream_github_mcp restart
+  # A dry run writes no unit or config, so there is nothing to restart.
+  when: not ansible_check_mode
+...

@@ -1,0 +1,40 @@
+---
+# Ansible connects as the guest "admin" user (passwordless sudo) with the key
+# lab-bootstrap.mk created; day-to-day work happens as "dev".
+ansible_user: admin
+ansible_ssh_private_key_file: "{{ lookup('env', 'HOME') }}/.ssh/key.d/local.fedora44min-x86_64-dev-ws@admin"
+# IdentitiesOnly: offer only the lab key; with a loaded ssh-agent, sshd's
+# MaxAuthTries can otherwise run out first ("Too many authentication failures").
+ansible_ssh_common_args: >-
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes
+ansible_python_interpreter: /usr/bin/python3
+
+# The account user-lane plays provision, and the key they connect with (both
+# made by cloud-init and lab-bootstrap.mk; see terraform/main.tf).
+guest_user: dev
+guest_user_ssh_key: "{{ lookup('env', 'HOME') }}/.ssh/key.d/local.fedora44min-x86_64-dev-ws@dev"
+
+# Packages vm-baseline.yml installs on every sandbox VM. Edit freely;
+# Terraform re-runs the baseline when any file under ansible/ changes.
+# podman, tmux and jq are not here: their roles own them (python-stack.yml).
+# Every package comes through the gateway's CONNECT proxy from the pinned
+# Fedora mirror (sandbox_egress).
+dev_packages:
+  - git
+  - gcc
+  - gcc-c++
+  - make
+  - cmake
+  - buildah
+  - skopeo
+  - python3
+  - python3-pip
+  - golang
+  - vim-enhanced
+  - htop
+  - unzip
+
+# Packages vm-baseline.yml installs on the upstream fixtures.
+upstream_packages:
+  - python3
+  - openssh-server

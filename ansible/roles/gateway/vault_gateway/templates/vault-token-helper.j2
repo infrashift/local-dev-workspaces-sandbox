@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# The vault CLI's token helper for the operator: `get` hands it the operator
+# token; `store` refuses, so `vault login` cannot leave another token in a
+# file. Break-glass reads go through make -f lab-gateway.mk break-glass, whose
+# short-lived token lives only in that shell's environment.
+set -euo pipefail
+case "${1:-}" in
+  # Without the file's newline: vault refuses a token with one.
+  get) printf '%s' "$(cat "{{ vault_gateway_operator_token_file }}")" ;;
+  store)
+    echo "vault login is off here: the CLI uses the operator token (make -f lab-gateway.mk break-glass)" >&2
+    exit 1
+    ;;
+  erase) ;;
+  *) exit 1 ;;
+esac

@@ -1,0 +1,10 @@
+---
+# Everything `make -f lab-provision.mk apply` configures (Terraform runs it):
+# the baseline on every VM, then the upstream fixtures. Stacks on the sandbox
+# (python-stack.yml) are applied separately with `play`.
+- name: Baseline
+  ansible.builtin.import_playbook: vm-baseline.yml
+
+- name: Upstream fixtures
+  ansible.builtin.import_playbook: upstream.yml
+...

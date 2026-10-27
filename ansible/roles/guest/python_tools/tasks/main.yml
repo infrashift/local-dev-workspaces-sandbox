@@ -1,0 +1,219 @@
+---
+# basedpyright (Python language server) with `uv tool install` into
+# ~/.local/share/uv/tools, entry point in ~/.local/bin. Needs the uv role, and
+# an interpreter the guest already has.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - python_tools_variant in python_tools_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      python_tools supports {{ python_tools_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ python_tools_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Assert that the play names the account it provisions
+  ansible.builtin.assert:
+    that: guest_user is defined and guest_user is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: "Set guest_user (the account this user-lane role installs for) at the play level."
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: python_tools_whoami
+  changed_when: false
+  check_mode: false
+
+# Everything lands in this account's home, so it must be the account running
+# the role -- files are then owned correctly by construction, with no become,
+# owner/group or chown. Facts must come from the same account: the home
+# directory is read from them.
+- name: Assert that the role runs in the user lane, as guest_user
+  ansible.builtin.assert:
+    that:
+      - python_tools_whoami.stdout == guest_user
+      - ansible_facts['user_id'] == guest_user
+    fail_msg: >-
+      python_tools installs into {{ guest_user }}'s home and must run as that account: apply
+      it from a play that connects as guest_user without become (it ran as
+      {{ python_tools_whoami.stdout }}; facts were gathered as {{ ansible_facts['user_id'] }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - python_tools_basedpyright_version is defined and python_tools_basedpyright_version is match('^\d+\.\d+\.\d+$')
+      - python_tools_python_version is defined and python_tools_python_version is match('^\d+\.\d+$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        python_tools_basedpyright_version  X.Y.Z (PyPI)
+        python_tools_python_version  X.Y: the interpreter the tool's virtualenv runs on;
+            it must already be installed (uv is told never to download one)
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "basedpyright {{ python_tools_basedpyright_version }} on python {{ python_tools_python_version }}"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS — userland only. Everything lands under ~/.local.
+# ---------------------------------------------------------------------------
+- name: Look for uv
+  ansible.builtin.stat:
+    path: "{{ python_tools_uv }}"
+  register: python_tools_uv_stat
+
+- name: Assert that uv is available
+  ansible.builtin.assert:
+    that: python_tools_uv_stat.stat.exists
+    fail_msg: >-
+      basedpyright installs with `uv tool install`, and found no uv at {{ python_tools_uv }}.
+      Apply the uv role earlier in the same play.
+    quiet: true
+  when: not ansible_check_mode
+
+# In a dry run the uv role may only have reported that it would install uv.
+- name: "Would install, once uv is installed: basedpyright {{ python_tools_basedpyright_version }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ python_tools_uv }} tool install --python {{ python_tools_python_version }}
+      basedpyright=={{ python_tools_basedpyright_version }}
+  changed_when: true
+  when: not python_tools_uv_stat.stat.exists
+
+- name: Install and verify basedpyright {{ python_tools_basedpyright_version }}
+  when: python_tools_uv_stat.stat.exists
+  block:
+    - name: "Check for the interpreter: Python {{ python_tools_python_version }}"
+      ansible.builtin.command:
+        argv: ["{{ python_tools_uv }}", python, find, "{{ python_tools_python_version }}"]
+      environment: "{{ python_tools_env }}"
+      register: python_tools_python
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Assert that the interpreter exists (uv will not download one)
+      ansible.builtin.assert:
+        that: python_tools_python.rc == 0
+        fail_msg: >-
+          No Python {{ python_tools_python_version }} is installed, and uv is told never to
+          download one. Fedora 44's system python3 is 3.14; on EL install the
+          matching python3.X package first (e.g. python3.12 on EL 9), or set
+          python_tools_python_version to an interpreter the guest has.
+          uv said: {{ python_tools_python.stderr | trim }}
+        success_msg: "python {{ python_tools_python_version }}: {{ python_tools_python.stdout | trim }}"
+
+    # Gate on the version the installed tool reports, not on uv's output: uv
+    # prints "... is already installed" on a no-op, which reads like a change.
+    - name: Check the installed basedpyright version
+      ansible.builtin.command:
+        argv: ["{{ python_tools_bin }}", --version]
+      environment: "{{ python_tools_env }}"
+      register: python_tools_installed
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Decide whether to install basedpyright {{ python_tools_basedpyright_version }}
+      ansible.builtin.set_fact:
+        python_tools_install_required: >-
+          {{ python_tools_installed.rc != 0
+             or python_tools_installed.stdout | regex_replace(python_tools_ansi_pattern, '')
+                is not search(python_tools_version_pattern) }}
+
+    - name: Would install basedpyright {{ python_tools_basedpyright_version }}
+      ansible.builtin.debug:
+        msg: >-
+          {{ python_tools_uv }} tool install --force --python {{ python_tools_python_version }}
+          basedpyright=={{ python_tools_basedpyright_version }}
+      changed_when: true
+      when: python_tools_install_required and ansible_check_mode
+
+    - name: "Install with uv tool install: basedpyright {{ python_tools_basedpyright_version }}"
+      ansible.builtin.command:
+        argv:
+          - "{{ python_tools_uv }}"
+          - tool
+          - install
+          - --force
+          - --python
+          - "{{ python_tools_python_version }}"
+          - "basedpyright=={{ python_tools_basedpyright_version }}"
+      environment: "{{ python_tools_env }}"
+      changed_when: true
+      when: python_tools_install_required and not ansible_check_mode
+
+    # basedpyright is a Node program; its dependency nodejs-wheel-binaries
+    # ships the Node runtime AND npm, and basedpyright only ever runs `node`.
+    # npm's own dependencies are what CVE scans find, so the code it never
+    # runs is removed. Only the npm tree and its launchers: `node` stays.
+    - name: Find the npm bundled with nodejs-wheel-binaries in basedpyright's venv
+      ansible.builtin.find:
+        paths: "{{ python_tools_venv }}"
+        recurse: true
+        file_type: any
+        patterns: [npm, npx, corepack]
+      register: python_tools_npm
+      when: not (ansible_check_mode and python_tools_install_required)
+
+    - name: Remove the bundled npm (basedpyright runs node, never npm)
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ python_tools_npm.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | replace(python_tools_venv ~ '/', '') }}"
+      when: >-
+        item.path is search('/nodejs_wheel/lib/node_modules/(npm|corepack)$')
+        or item.path is search('/nodejs_wheel/bin/(npm|npx|corepack)$')
+        or item.path is search('/bin/(npm|npx|corepack)$')
+
+    - name: Check that no bundled npm is left
+      ansible.builtin.find:
+        paths: "{{ python_tools_venv }}"
+        recurse: true
+        file_type: directory
+        patterns: [npm]
+      register: python_tools_npm_left
+      when: not (ansible_check_mode and python_tools_install_required)
+
+    # -----------------------------------------------------------------------
+    # VERIFICATION — skipped only in a dry run that would install.
+    # -----------------------------------------------------------------------
+    - name: Verify basedpyright
+      ansible.builtin.command:
+        argv: ["{{ python_tools_bin }}", --version]
+      environment: "{{ python_tools_env }}"
+      register: python_tools_verify
+      changed_when: false
+      check_mode: false
+      when: not (ansible_check_mode and python_tools_install_required)
+
+    - name: "Assert that the requested version is installed: basedpyright {{ python_tools_basedpyright_version }}"
+      ansible.builtin.assert:
+        that:
+          - >-
+            python_tools_verify.stdout | regex_replace(python_tools_ansi_pattern, '')
+            is search(python_tools_version_pattern)
+          - python_tools_npm_left.files | selectattr('path', 'search', '/node_modules/npm$') | list | length == 0
+        fail_msg: >-
+          Expected basedpyright {{ python_tools_basedpyright_version }}; it reported: {{ python_tools_verify.stdout }}
+        success_msg: "{{ python_tools_verify.stdout_lines | join('; ') }}"
+      when: not (ansible_check_mode and python_tools_install_required)
+...

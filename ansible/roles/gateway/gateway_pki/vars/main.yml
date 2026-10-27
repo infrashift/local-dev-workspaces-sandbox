@@ -1,0 +1,33 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none.
+# ---------------------------------------------------------------------------
+# Root-only: the gateway CA key never leaves this directory.
+gateway_pki_ca_key: "{{ gateway_pki_dir }}/gateway-ca.key"
+gateway_pki_ca_cert: "{{ gateway_pki_dir }}/gateway-ca.pem"
+# Envoy reads the leaf key through its group.
+gateway_pki_leaf_key: "{{ gateway_pki_dir }}/gateway.key"
+gateway_pki_leaf_cert: "{{ gateway_pki_dir }}/gateway.pem"
+# What the sandbox guests trust (ca_trust copies every *.pem here to them).
+gateway_pki_ca_export: "{{ gateway_pki_trust_export_dir }}/ai-sandbox-gateway-ca.pem"
+# The upstream-test CA verifies the lab's own upstream servers (the
+# self-hosted GitHub MCP server). A test fixture: the operator owns it, and
+# the upstream playbook copies the server's key to upstream-1.
+gateway_pki_upstream_ca_key: "{{ gateway_pki_upstream_dir }}/upstream-ca.key"
+gateway_pki_upstream_ca_cert: "{{ gateway_pki_upstream_dir }}/upstream-ca.pem"
+gateway_pki_upstream_leaf_key: "{{ gateway_pki_upstream_dir }}/mcp.key"
+gateway_pki_upstream_leaf_cert: "{{ gateway_pki_upstream_dir }}/mcp.pem"
+# Envoy's copy of the upstream-test CA certificate.
+gateway_pki_upstream_ca_installed: "{{ gateway_pki_dir }}/upstream-ca.pem"
+gateway_pki_ca_days: "+3650d"
+# The names the gateway CA may vouch for (its critical name constraints):
+# the gateway hosts, and no IP address at all. Not even the gateway's: Bun
+# (Claude Code's runtime) refuses a chain that matches an IP SAN against an
+# IP subtree (UNSUPPORTED_CONSTRAINT_TYPE), and the guests reach the gateway
+# by name (/etc/hosts), so Envoy's certificate carries no IP SAN. The
+# excluded subtrees keep the CA from vouching for any IPv4 or IPv6 address.
+gateway_pki_ca_permitted: "{{ gateway_pki_gateway_hosts | map('regex_replace', '^', 'DNS:') | list }}"
+gateway_pki_ca_excluded: ["IP:0.0.0.0/0", "IP:::/0"]
+gateway_pki_leaf_days: "+825d"
+...

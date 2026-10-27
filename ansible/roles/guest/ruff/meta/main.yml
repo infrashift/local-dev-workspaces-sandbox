@@ -1,0 +1,25 @@
+---
+# Ported from: trusted-devcontainer-features src/uv-ruff/ansible-role-feature (ruff half) @ 944b438
+galaxy_info:
+  author: infrashift
+  description: Astral ruff from the SHA-256 pinned release tarball, userland, on Fedora and EL guests
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Fedora
+      versions:
+        - "44"
+    - name: EL
+      versions:
+        - "9"
+        - "10"
+  galaxy_tags:
+    - ruff
+    - python
+    - astral
+    - fedora
+    - rhel
+
+dependencies: []
+...

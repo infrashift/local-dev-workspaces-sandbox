@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  author: infrashift
+  description: An SCP target account that accepts only certificates from the lab's Vault SSH CA (scenario 4)
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Fedora
+      versions:
+        - "44"
+  galaxy_tags:
+    - ssh
+    - testing
+    - fedora
+
+dependencies: []
+...

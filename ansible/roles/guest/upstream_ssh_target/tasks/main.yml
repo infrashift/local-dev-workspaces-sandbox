@@ -1,0 +1,144 @@
+---
+# The SCP target (scenario 4): an account with no password and no authorized
+# key, which sshd lets in only with a user certificate signed by the lab's
+# Vault SSH CA for its principal. The sandbox reaches it through the gateway's
+# CONNECT tunnel, authenticating with the forwarded sandbox ssh-agent. System
+# lane.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - upstream_ssh_target_variant in upstream_ssh_target_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      upstream_ssh_target supports {{ upstream_ssh_target_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ upstream_ssh_target_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: upstream_ssh_target_whoami
+  changed_when: false
+  check_mode: false
+
+- name: Assert that the role runs in the system lane
+  ansible.builtin.assert:
+    that: upstream_ssh_target_whoami.stdout == 'root'
+    fail_msg: >-
+      upstream_ssh_target writes system state and must run as root: apply it from a play with
+      become: true (it ran as {{ upstream_ssh_target_whoami.stdout }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - upstream_ssh_target_user is defined and upstream_ssh_target_user is match('^[a-z][a-z0-9-]*$')
+      - upstream_ssh_target_ca_key is defined and upstream_ssh_target_ca_key is match('^ssh-ed25519 [A-Za-z0-9+/=]+')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        upstream_ssh_target_user    the account (and the certificate principal) scp lands in
+        upstream_ssh_target_ca_key  the Vault SSH CA's public key (ssh-ed25519 ...)
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "{{ upstream_ssh_target_user }}: Vault SSH CA certificates only"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Create the SCP target account (no password, no authorized key)
+  ansible.builtin.user:
+    name: "{{ upstream_ssh_target_user }}"
+    shell: /bin/bash
+    password: "!"
+    password_lock: true
+
+- name: Remove any authorized key, so a certificate is the only way in
+  ansible.builtin.file:
+    path: "/home/{{ upstream_ssh_target_user }}/.ssh/authorized_keys"
+    state: absent
+
+- name: Trust the Vault SSH CA
+  ansible.builtin.copy:
+    content: "{{ upstream_ssh_target_ca_key | trim }}\n"
+    dest: "{{ upstream_ssh_target_ca_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: upstream_ssh_target reload sshd
+
+- name: Create the principals directory
+  ansible.builtin.file:
+    path: "{{ upstream_ssh_target_principals_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Allow the account's principal
+  ansible.builtin.copy:
+    content: "{{ upstream_ssh_target_user }}\n"
+    dest: "{{ upstream_ssh_target_principals_dir }}/{{ upstream_ssh_target_user }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Configure sshd for the CA
+  ansible.builtin.template:
+    src: sshd-user-ca.conf.j2
+    dest: "{{ upstream_ssh_target_sshd_config }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: upstream_ssh_target reload sshd
+
+# A drop-in cannot be validated alone; check the whole configuration before the
+# reload handler runs (a failed task stops it, and sshd keeps its old config).
+- name: Check sshd's whole configuration
+  ansible.builtin.command: /usr/sbin/sshd -t
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Apply a pending sshd reload now
+  ansible.builtin.meta: flush_handlers
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — sshd's effective configuration trusts the CA for the account.
+# ---------------------------------------------------------------------------
+- name: Read sshd's effective configuration for the account
+  ansible.builtin.command: sshd -T -C user={{ upstream_ssh_target_user }},host=localhost,addr=127.0.0.1
+  register: upstream_ssh_target_effective
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Assert sshd trusts the Vault SSH CA for the account's principal
+  ansible.builtin.assert:
+    that:
+      - >-
+        upstream_ssh_target_effective.stdout
+        is search('(?mi)^trustedusercakeys ' ~ (upstream_ssh_target_ca_file | regex_escape) ~ '$')
+      - >-
+        upstream_ssh_target_effective.stdout
+        is search('(?mi)^authorizedprincipalsfile ' ~ (upstream_ssh_target_principals_dir | regex_escape) ~ '/%u$')
+    fail_msg: >-
+      sshd -T: {{ upstream_ssh_target_effective.stdout_lines | select('search', '(?i)trusted|principals') | list }}
+    success_msg: "{{ upstream_ssh_target_user }} accepts {{ upstream_ssh_target_ca_file }} certificates"
+  when: not ansible_check_mode
+...

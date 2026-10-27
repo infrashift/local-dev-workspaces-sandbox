@@ -1,0 +1,13 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES. Not caller-settable: defaults/ is reserved for inputs, and
+# this role has none.
+# ---------------------------------------------------------------------------
+vm_storage_lab_pool_dir: "{{ vm_storage_pools_dir }}/{{ vm_storage_lab_name }}"
+vm_storage_dirs:
+  - "{{ vm_storage_images_dir }}"
+  - "{{ vm_storage_pools_dir }}"
+  - "{{ vm_storage_lab_pool_dir }}"
+# The operator downloads base images and runs Terraform without sudo.
+vm_storage_owner: "{{ ansible_facts['user_id'] }}"
+...

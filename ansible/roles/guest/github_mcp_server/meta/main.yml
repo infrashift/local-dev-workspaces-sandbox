@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  author: infrashift
+  description: The GitHub MCP server from its SHA-256 pinned release, userland, on Fedora guests
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Fedora
+      versions:
+        - "44"
+  galaxy_tags:
+    - mcp
+    - github
+    - fedora
+
+dependencies: []
+...

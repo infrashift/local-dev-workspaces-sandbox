@@ -1,0 +1,206 @@
+---
+# Syft from the anchore release tarball, verified against the release's
+# checksums file, into ~/.local/share/syft/<version>, linked into
+# ~/.local/bin.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - syft_variant in syft_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      syft supports {{ syft_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ syft_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Assert that the play names the account it provisions
+  ansible.builtin.assert:
+    that: guest_user is defined and guest_user is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: "Set guest_user (the account this user-lane role installs for) at the play level."
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: syft_whoami
+  changed_when: false
+  check_mode: false
+
+# Everything lands in this account's home, so it must be the account running
+# the role -- files are then owned correctly by construction, with no become,
+# owner/group or chown. Facts must come from the same account: the home
+# directory is read from them.
+- name: Assert that the role runs in the user lane, as guest_user
+  ansible.builtin.assert:
+    that:
+      - syft_whoami.stdout == guest_user
+      - ansible_facts['user_id'] == guest_user
+    fail_msg: >-
+      syft installs into {{ guest_user }}'s home and must run as that account: apply
+      it from a play that connects as guest_user without become (it ran as
+      {{ syft_whoami.stdout }}; facts were gathered as {{ ansible_facts['user_id'] }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+#
+#   pass-through  syft_checksum: must be DEFINED, may be empty -- empty means
+#                 "resolve from the release's checksums file".
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - syft_version is defined and syft_version is match('^\d+\.\d+\.\d+$')
+      - syft_checksum is defined
+      - syft_checksum | length == 0 or syft_checksum is match('^[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        syft_version   X.Y.Z, without the leading v
+        syft_checksum  '' to resolve from {{ syft_checksums_file }}, or the
+                         64-hex SHA-256 of {{ syft_tarball }}
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "syft {{ syft_version }} ({{ syft_arch }})"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Check the installed syft version
+  ansible.builtin.command: "{{ syft_bin_dir }}/syft version"
+  register: syft_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# `syft version` prints a "Version:   X.Y.Z" line; match that whole line.
+- name: Decide whether to install syft {{ syft_version }}
+  ansible.builtin.set_fact:
+    syft_install_required: >-
+      {{ syft_installed.rc != 0 or syft_installed.stdout is not search(syft_version_pattern) }}
+
+- name: Would download, SHA-256 verify and install syft {{ syft_version }}
+  ansible.builtin.debug:
+    msg: "{{ syft_download_url }} -> {{ syft_install_dir }}"
+  changed_when: true
+  when: syft_install_required and ansible_check_mode
+
+- name: Install syft {{ syft_version }}
+  when: syft_install_required and not ansible_check_mode
+  block:
+    - name: Create a scratch directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -syft
+      register: syft_tmp
+
+    # The checksums file cannot verify itself; it is fetched over TLS from the
+    # same release as the tarball.
+    - name: Download the syft checksums file
+      ansible.builtin.get_url:
+        url: "{{ syft_checksums_download_url }}"
+        dest: "{{ syft_tmp.path }}/{{ syft_checksums_file }}"
+        mode: "0644"
+        timeout: 60
+      when: syft_checksum | length == 0
+
+    - name: Read the syft checksums file
+      ansible.builtin.slurp:
+        src: "{{ syft_tmp.path }}/{{ syft_checksums_file }}"
+      register: syft_checksums
+      when: syft_checksum | length == 0
+
+    - name: Resolve the SHA-256 for {{ syft_tarball }}
+      ansible.builtin.set_fact:
+        syft_effective_checksum: >-
+          {{ syft_checksum if syft_checksum | length > 0
+             else (syft_checksums.content | b64decode
+                   | regex_search('(?m)^([0-9a-f]{64})\s+\*?' ~ (syft_tarball | regex_escape) ~ '$', '\1')
+                   | default([''], true) | first) }}
+
+    # A resolved-empty checksum means get_url would SKIP verification, not fail it.
+    - name: "Assert that a checksum is available: syft {{ syft_version }}"
+      ansible.builtin.assert:
+        that: syft_effective_checksum is match('^[0-9a-fA-F]{64}$')
+        fail_msg: >-
+          No SHA-256 resolved for {{ syft_tarball }}: it is not listed in
+          {{ syft_checksums_file }}, and no syft_checksum was supplied.
+        quiet: true
+
+    - name: Download the syft tarball (verified against the SHA-256)
+      ansible.builtin.get_url:
+        url: "{{ syft_download_url }}"
+        dest: "{{ syft_tmp.path }}/{{ syft_tarball }}"
+        checksum: "sha256:{{ syft_effective_checksum }}"
+        mode: "0644"
+        timeout: 120
+
+    - name: Remove any previously installed syft
+      ansible.builtin.file:
+        path: "{{ syft_install_root }}"
+        state: absent
+
+    - name: Create the syft install directory
+      ansible.builtin.file:
+        path: "{{ syft_install_dir }}"
+        state: directory
+        mode: "0755"
+
+    # The tarball also carries the licence and README; only the binary is kept.
+    - name: Extract the syft binary
+      ansible.builtin.unarchive:
+        src: "{{ syft_tmp.path }}/{{ syft_tarball }}"
+        dest: "{{ syft_install_dir }}"
+        remote_src: true
+        include: [syft]
+
+  always:
+    - name: Remove the scratch directory
+      ansible.builtin.file:
+        path: "{{ syft_tmp.path }}"
+        state: absent
+      when: syft_tmp.path is defined
+
+- name: Ensure ~/.local/bin exists
+  ansible.builtin.file:
+    path: "{{ syft_bin_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Link syft into ~/.local/bin
+  ansible.builtin.file:
+    src: "{{ syft_install_dir }}/syft"
+    dest: "{{ syft_bin_dir }}/syft"
+    state: link
+    force: true
+  when: not (ansible_check_mode and syft_install_required)
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the REQUESTED version. Skipped only in a dry run that would
+# install.
+# ---------------------------------------------------------------------------
+- name: Verify the installed syft version
+  ansible.builtin.command: "{{ syft_bin_dir }}/syft version"
+  register: syft_verify
+  changed_when: false
+  check_mode: false
+  when: not (ansible_check_mode and syft_install_required)
+
+- name: "Assert that the requested version is installed: syft {{ syft_version }}"
+  ansible.builtin.assert:
+    that: syft_verify.stdout is search(syft_version_pattern)
+    fail_msg: "Expected syft {{ syft_version }}; `syft version` reported: {{ syft_verify.stdout }}"
+    success_msg: "syft {{ syft_version }} installed and verified."
+  when: not (ansible_check_mode and syft_install_required)
+...

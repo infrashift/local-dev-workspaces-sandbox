@@ -1,0 +1,13 @@
+---
+# Add one catalog category's entries to the desired baseline:
+#   <category>/<host>:<port> -> {"reason", "category", "source"} (JSON)
+- name: "Add a category's entries to the baseline: {{ consul_egress_category }}"
+  ansible.builtin.set_fact:
+    consul_egress_desired: >-
+      {{ consul_egress_desired | combine({
+           consul_egress_category ~ '/' ~ item.host ~ ':' ~ (item.port | default(443)):
+           {'reason': item.reason, 'category': consul_egress_category, 'source': 'baseline'} | to_json}) }}
+  loop: "{{ consul_egress_catalog[consul_egress_category].entries }}"
+  loop_control:
+    label: "{{ item.host }}"
+...

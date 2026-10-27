@@ -1,0 +1,8 @@
+# {{ ansible_managed }}
+# The sandbox's SURROGATE credentials: worthless anywhere but the ai-sandbox
+# gateway, which swaps each for the real one, and only for the hosts it is
+# bound to. No real credential is ever written into this guest.
+{% for name, surrogate in sandbox_surrogates_surrogates | dictsort %}
+# {{ name }}: {{ surrogate.scheme }} for {{ surrogate.target_hosts | join(', ') }}
+export AI_SANDBOX_{{ name | upper }}_SURROGATE='{{ surrogate.credential }}'
+{% endfor %}

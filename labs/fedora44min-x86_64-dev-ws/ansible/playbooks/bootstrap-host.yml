@@ -1,0 +1,109 @@
+---
+# Prepare this Linux x86_64 host for the lab. Run through lab-bootstrap.mk,
+# which always does a dry run (--check --diff) first and applies only after
+# you type "yes":
+#
+#   make -f lab-bootstrap.mk host [TAGS=ssh,image]
+#
+# Paths come from lab-config.mk as one JSON extra-vars document (lab_name,
+# images_dir, pools_dir, tools_bin, project_root, sandbox_vm, ...); the pins
+# below are the single source of truth for host tooling. The roles have NO
+# defaults, so every role parameter is passed here explicitly. Privileged
+# roles take the sudo password from the become vault (inventory-host/).
+- name: Bootstrap the Linux x86_64 host for fedora44min-x86_64-dev-ws
+  hosts: localhost
+  gather_facts: true
+
+  vars:
+    apt_packages:
+      - qemu-system-x86
+      - qemu-utils
+      - libvirt-daemon-system
+      - libvirt-clients
+      - ovmf
+      - gnupg
+      - gpgv
+      - unzip
+      - curl
+      - openssl
+      - netcat-openbsd
+      - shellcheck
+    # The operator drives libvirt (qemu:///system) and KVM without sudo.
+    operator_groups: [libvirt, kvm]
+    # Non-Secure-Boot OVMF: the .ms/.secboot variants hang unsigned guests.
+    ovmf_firmware:
+      - /usr/share/OVMF/OVMF_CODE_4M.fd
+      - /usr/share/OVMF/OVMF_VARS_4M.fd
+    ruff_version: "0.17.2"
+    terraform_version: "1.17.0"
+    # "HashiCorp Security (hashicorp.com/security) <security@hashicorp.com>",
+    # as published at https://www.hashicorp.com/security. It signs every
+    # product's SHA256SUMS (through a subkey) until it expires on 2030-03-01.
+    hashicorp_key_fpr: C874011F0AB405110D02105534365D9472D7468F
+    fedora_release: "44"
+    fedora_respin: "1.7"
+    # "Fedora (44) <fedora-44-primary@fedoraproject.org>", as published at
+    # https://fedoraproject.org/security/ and in the fedora-repos package.
+    fedora_key_fpr: 36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6
+
+  pre_tasks:
+    - name: Assert lab-bootstrap.mk passed the lab values
+      ansible.builtin.assert:
+        that:
+          - lab_name is defined
+          - images_dir is defined
+          - pools_dir is defined
+          - tools_bin is defined
+          - project_root is defined
+          - sandbox_vm is defined
+          - sandbox_agent_sock is defined
+        fail_msg: "Run this playbook through: make -f lab-bootstrap.mk host"
+        quiet: true
+      tags: [always]
+
+  roles:
+    - role: linux_host_packages
+      linux_host_packages_packages: "{{ apt_packages }}"
+      linux_host_packages_groups: "{{ operator_groups }}"
+      linux_host_packages_firmware: "{{ ovmf_firmware }}"
+      tags: [packages]
+
+    - role: vm_storage
+      vm_storage_images_dir: "{{ images_dir }}"
+      vm_storage_pools_dir: "{{ pools_dir }}"
+      vm_storage_lab_name: "{{ lab_name }}"
+      tags: [storage]
+
+    - role: lab_ssh
+      lab_ssh_lab_name: "{{ lab_name }}"
+      lab_ssh_roles: [admin, dev]
+      lab_ssh_vm_proxy: "{{ project_root }}/terraform/modules/libvirt-vm/scripts/vm-proxy.sh"
+      lab_ssh_default_vm: "{{ sandbox_vm }}"
+      lab_ssh_agent_socket: "{{ sandbox_agent_sock }}"
+      tags: [ssh]
+
+    - role: release_binary
+      release_binary_name: ruff
+      release_binary_version: "{{ ruff_version }}"
+      release_binary_url: >-
+        https://github.com/astral-sh/ruff/releases/download/{{ ruff_version }}/ruff-x86_64-unknown-linux-gnu.tar.gz
+      release_binary_files: [ruff]
+      release_binary_dest: "{{ tools_bin }}"
+      tags: [ruff]
+
+    - role: hashicorp_release
+      hashicorp_release_product: terraform
+      hashicorp_release_version: "{{ terraform_version }}"
+      hashicorp_release_key_fpr: "{{ hashicorp_key_fpr }}"
+      hashicorp_release_dest: "{{ tools_bin }}"
+      tags: [terraform]
+
+    - role: fedora_cloud_image
+      fedora_cloud_image_release: "{{ fedora_release }}"
+      fedora_cloud_image_respin: "{{ fedora_respin }}"
+      fedora_cloud_image_arch: x86_64
+      fedora_cloud_image_key_fpr: "{{ fedora_key_fpr }}"
+      fedora_cloud_image_dir: "{{ images_dir }}"
+      fedora_cloud_image_qemu_img: /usr/bin/qemu-img
+      tags: [image]
+...

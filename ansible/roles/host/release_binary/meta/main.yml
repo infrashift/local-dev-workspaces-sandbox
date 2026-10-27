@@ -1,0 +1,17 @@
+---
+galaxy_info:
+  author: infrashift
+  description: A GitHub-release tool installed from a SHA-256 verified tarball on the Linux x86_64 host
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - release
+    - linux
+
+dependencies: []
+...

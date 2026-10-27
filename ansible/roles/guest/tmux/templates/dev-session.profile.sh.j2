@@ -1,0 +1,38 @@
+# {{ tmux_profile_hook }}
+# Rendered by the ai-sandbox 'tmux' role. Edits are overwritten.
+#
+# Starts dev-session on interactive terminal logins (autostart={{ tmux_autostart }}).
+#
+# Sourced by /etc/profile for login shells -- which is what sshd starts -- and
+# by /etc/bashrc for interactive non-login shells, such as a tmux pane or a
+# nested `bash`. It deliberately does nothing unless ALL of these hold:
+#
+#   * the shell is bash and interactive, with a terminal on stdin and stdout.
+#     `ssh host cmd`, VS Code's server and scripted probes have no TTY and
+#     are never touched.
+#   * it is not already inside tmux.
+#   * it is not an IDE's integrated terminal (VS Code, JetBrains), which
+#     manage their own panes.
+#   * DEV_SESSION is not "off", and ~/.config/dev-session/disabled does not exist.
+#   * for autostart=ssh, the login arrived over ssh.
+#
+# When dev-session returns successfully -- the developer detached -- the login
+# ends. When it fails, the login falls
+# through to an ordinary shell instead of locking the developer out.
+_dev_session_autostart={{ tmux_autostart | quote }}
+if [ "${_dev_session_autostart}" != never ] \
+    && [ -n "${BASH_VERSION:-}" ] \
+    && case $- in *i*) true ;; *) false ;; esac \
+    && [ -t 0 ] && [ -t 1 ] \
+    && [ -z "${TMUX:-}" ] \
+    && [ "${TERM_PROGRAM:-}" != vscode ] \
+    && [ -z "${TERMINAL_EMULATOR:-}" ] \
+    && [ "${DEV_SESSION:-}" != off ] \
+    && [ ! -e "${HOME}/.config/dev-session/disabled" ] \
+    && { [ "${_dev_session_autostart}" = interactive ] || [ -n "${SSH_CONNECTION:-}" ]; } \
+    && command -v tmux >/dev/null 2>&1; then
+    unset _dev_session_autostart
+    {{ tmux_session_bin }} && exit 0
+    echo "dev-session: could not start the tmux layout; continuing with a plain shell" >&2
+fi
+unset _dev_session_autostart

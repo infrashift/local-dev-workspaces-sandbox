@@ -1,0 +1,184 @@
+---
+# One GitHub-release tool, installed from a tarball that publishes a sibling
+# "<tarball>.sha256" (the astral-sh uv/ruff convention).
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - release_binary_name is defined and release_binary_name is match('^[A-Za-z0-9._-]+$')
+      - release_binary_version is defined and release_binary_version is match('^\d+\.\d+\.\d+$')
+      - release_binary_url is defined and release_binary_url is match('^https://\S+\.tar\.gz$')
+      - release_binary_files is defined and release_binary_files is sequence and release_binary_files is not string
+      - release_binary_files | length > 0
+      - release_binary_files | reject('match', '^[A-Za-z0-9._-]+$') | list | length == 0
+      - release_binary_name in release_binary_files
+      - release_binary_dest is defined and release_binary_dest is match('^/[^ ]+$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        release_binary_name     the binary whose `--version` reports release_binary_version
+        release_binary_version  X.Y.Z
+        release_binary_url      https://... .tar.gz, with a sibling <url>.sha256
+        release_binary_files    non-empty list of binaries to install; must include release_binary_name
+        release_binary_dest     absolute install directory
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "{{ release_binary_label }} -> {{ release_binary_dest }}"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: "Check the installed version of {{ release_binary_name }}"
+  ansible.builtin.command: "{{ release_binary_dest }}/{{ release_binary_name }} --version"
+  register: release_binary_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Decide whether to install {{ release_binary_label }}"
+  ansible.builtin.set_fact:
+    release_binary_needed: >-
+      {{ release_binary_installed.rc != 0
+         or (' ' ~ release_binary_version) not in release_binary_installed.stdout }}
+
+- name: "Would download, SHA-256 verify and install {{ release_binary_label }}"
+  ansible.builtin.debug:
+    msg: "{{ release_binary_url }} -> {{ release_binary_dest }}"
+  changed_when: true
+  when: release_binary_needed and ansible_check_mode
+
+- name: "Install {{ release_binary_label }}"
+  when: release_binary_needed and not ansible_check_mode
+  block:
+    - name: Create a scratch directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: "-{{ release_binary_name }}"
+      register: release_binary_tmp
+
+    # The checksums file cannot verify itself; it is fetched over TLS from the
+    # same release as the tarball.
+    - name: Download the published SHA-256 file
+      ansible.builtin.get_url:
+        url: "{{ release_binary_url }}.sha256"
+        dest: "{{ release_binary_tmp.path }}/tarball.sha256"
+        mode: "0644"
+
+    - name: Read the published SHA-256
+      ansible.builtin.slurp:
+        src: "{{ release_binary_tmp.path }}/tarball.sha256"
+      register: release_binary_sha
+
+    - name: Extract the digest
+      ansible.builtin.set_fact:
+        release_binary_sha256: "{{ (release_binary_sha.content | b64decode).split() | first | default('', true) }}"
+
+    # An empty digest would make get_url skip verification rather than fail it.
+    - name: Assert that a SHA-256 was published for the tarball
+      ansible.builtin.assert:
+        that: release_binary_sha256 is match('^[0-9a-f]{64}$')
+        fail_msg: "{{ release_binary_url }}.sha256 did not hold a SHA-256 digest"
+        quiet: true
+
+    - name: Download the tarball (verified against the SHA-256)
+      ansible.builtin.get_url:
+        url: "{{ release_binary_url }}"
+        dest: "{{ release_binary_tmp.path }}/tarball.tar.gz"
+        checksum: "sha256:{{ release_binary_sha256 }}"
+        mode: "0644"
+
+    # Plain tar keeps the extracted tree exactly as published for the find below.
+    # check-mode: inside the install block; the "Would ..." task reports it.
+    - name: Unpack the tarball  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: tar -xzf tarball.tar.gz
+        chdir: "{{ release_binary_tmp.path }}"
+      changed_when: true
+
+    - name: Find the binaries
+      ansible.builtin.find:
+        paths: "{{ release_binary_tmp.path }}"
+        patterns: "{{ release_binary_files }}"
+        recurse: true
+        file_type: file
+      register: release_binary_found
+
+    - name: Assert that the tarball holds every requested binary
+      ansible.builtin.assert:
+        that: >-
+          release_binary_found.files | map(attribute='path') | map('basename') | unique | sort
+          == release_binary_files | sort
+        fail_msg: >-
+          Expected {{ release_binary_files | join(', ') }} in the tarball; found
+          {{ release_binary_found.files | map(attribute='path') | map('basename') | join(', ') }}
+        quiet: true
+
+    - name: Ensure the destination directory exists
+      ansible.builtin.file:
+        path: "{{ release_binary_dest }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Install into {{ release_binary_dest }}"
+      ansible.builtin.copy:
+        src: "{{ item.path }}"
+        dest: "{{ release_binary_dest }}/{{ item.path | basename }}"
+        remote_src: true
+        mode: "0755"
+      loop: "{{ release_binary_found.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+  always:
+    - name: Remove the scratch directory
+      ansible.builtin.file:
+        path: "{{ release_binary_tmp.path }}"
+        state: absent
+      when: release_binary_tmp.path is defined
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the REQUESTED version, not merely a binary that runs.
+# Skipped only in a dry run that would install.
+# ---------------------------------------------------------------------------
+- name: "Verify the installed version of {{ release_binary_name }}"
+  ansible.builtin.command: "{{ release_binary_dest }}/{{ release_binary_name }} --version"
+  register: release_binary_verify
+  changed_when: false
+  check_mode: false
+  when: not (release_binary_needed and ansible_check_mode)
+
+- name: "Assert that the requested version is installed: {{ release_binary_label }}"
+  ansible.builtin.assert:
+    that: >-
+      (release_binary_verify.stdout | trim) is search('(^|\s)v?' ~ (release_binary_version | regex_escape) ~ '(\s|$)')
+    fail_msg: >-
+      Expected {{ release_binary_label }}; {{ release_binary_name }} --version said: {{ release_binary_verify.stdout }}
+    success_msg: "{{ release_binary_verify.stdout | trim }}"
+  when: not (release_binary_needed and ansible_check_mode)
+...

@@ -1,0 +1,42 @@
+#!/usr/sbin/nft -f
+# {{ ansible_managed }}
+# The sandbox network's host firewall (concepts/Isolated Sandbox Network).
+# Its own table, loaded by ai-sandbox-firewall.service: nftables.service is
+# never enabled, because its `flush ruleset` would wipe libvirt's and
+# docker's tables. A reject in this table is final even where libvirt's own
+# tables accept.
+#
+# The gateway address {{ sandbox_firewall_gateway_ip }} answers only the sandbox bridge and
+# the host itself (lo). Linux accepts a packet for any of its addresses on any
+# interface (the weak host model), so without this a LAN peer with a static
+# route, a VM on another libvirt network or a docker container could reach
+# Envoy and have the published surrogates swapped for the real credentials.
+#
+# From the sandbox bridge ({{ sandbox_firewall_bridge }}) the host accepts only:
+#   replies to connections the host opened (Ansible and ssh into the guest),
+#   DHCP from libvirt's dnsmasq,
+#   Envoy's CONNECT tunnel and TLS gateway on {{ sandbox_firewall_gateway_ip }}.
+# It forwards nothing to or from the sandbox bridge, so no route out exists
+# even if one were added in the guest.
+#
+# Re-runnable: the first line makes sure the table exists, so the delete
+# always succeeds, and the whole file applies atomically.
+table inet {{ sandbox_firewall_table }}
+delete table inet {{ sandbox_firewall_table }}
+
+table inet {{ sandbox_firewall_table }} {
+  chain input {
+    type filter hook input priority filter - 10; policy accept;
+    ip daddr {{ sandbox_firewall_gateway_ip }} iifname != { "lo", "{{ sandbox_firewall_bridge }}" } counter reject with icmpx admin-prohibited
+    iifname "{{ sandbox_firewall_bridge }}" ct state established,related accept
+    iifname "{{ sandbox_firewall_bridge }}" udp sport 68 udp dport 67 accept
+    iifname "{{ sandbox_firewall_bridge }}" ip daddr {{ sandbox_firewall_gateway_ip }} tcp dport { {{ sandbox_firewall_ports | join(', ') }} } ct state new accept
+    iifname "{{ sandbox_firewall_bridge }}" counter reject with icmpx admin-prohibited
+  }
+
+  chain forward {
+    type filter hook forward priority filter - 10; policy accept;
+    iifname "{{ sandbox_firewall_bridge }}" counter reject with icmpx admin-prohibited
+    oifname "{{ sandbox_firewall_bridge }}" counter reject with icmpx admin-prohibited
+  }
+}

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# {{ tmux_session_bin }}
+# Rendered by the ai-sandbox 'tmux' role. Edits are overwritten.
+#
+# Attach to the development tmux session, creating it first if it does not
+# exist yet:
+#
+#   ┌─────────────────────────┬──────────────┐
+#   │         editor          │    shell     │
+#   │                         │              │
+#   └─────────────────────────┴──────────────┘
+#
+# Re-running it (or logging in again) re-attaches to the same session, so work
+# survives a dropped connection.
+set -euo pipefail
+
+SESSION="${DEV_SESSION_NAME:-{{ tmux_session_name }}}"
+EDITOR_CMD={{ tmux_editor_pane_command | quote }}
+SHELL_PCT={{ tmux_shell_pane_percent }}
+
+usage() {
+    cat <<EOF
+Usage: dev-session [--detach]
+
+Attach to the tmux session '${SESSION}', creating the editor | shell layout
+first if the session does not exist.
+
+  --detach   create the session if needed, but do not attach to it
+
+Environment:
+  DEV_SESSION_NAME   session name (default: {{ tmux_session_name }})
+  DEV_SESSION_DIR    working directory for new panes (default: current directory)
+
+Automatic start on login is controlled by the login hook in
+{{ tmux_profile_hook }}. Disable it for one login with DEV_SESSION=off, or
+permanently with: mkdir -p ~/.config/dev-session && touch ~/.config/dev-session/disabled
+EOF
+}
+
+detach=0
+case "${1:-}" in
+    "") ;;
+    --detach) detach=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+esac
+
+# tmux refuses to start under a TERM this container has no description for,
+# which is exactly what a newer terminal emulator sends (xterm-ghostty,
+# xterm-kitty, ...). Fall back to a description every client understands.
+if ! infocmp "${TERM:-dumb}" >/dev/null 2>&1; then
+    export TERM=xterm-256color
+fi
+
+DIR="${DEV_SESSION_DIR:-$PWD}"
+
+if ! tmux has-session -t "=${SESSION}" 2>/dev/null; then
+    # Size the first window to the client when there is one, so the split
+    # lands where it will be seen rather than being redrawn on attach.
+    cols=200 lines=50
+    if [ -t 1 ]; then
+        cols=$(tput cols 2>/dev/null || echo 200)
+        lines=$(tput lines 2>/dev/null || echo 50)
+    fi
+    # When the editor exits, its pane becomes a login shell instead of
+    # closing -- quitting Neovim should not tear down half the layout.
+    tmux new-session -d -s "${SESSION}" -x "${cols}" -y "${lines}" -c "${DIR}" \
+        "${EDITOR_CMD}; exec bash -l"
+    tmux split-window -h -t "=${SESSION}:" -l "${SHELL_PCT}%" -c "${DIR}"
+    tmux select-pane -t "=${SESSION}:" -L
+fi
+
+[ "${detach}" -eq 1 ] && exit 0
+
+if [ -n "${TMUX:-}" ]; then
+    exec tmux switch-client -t "=${SESSION}"
+fi
+exec tmux attach-session -t "=${SESSION}"

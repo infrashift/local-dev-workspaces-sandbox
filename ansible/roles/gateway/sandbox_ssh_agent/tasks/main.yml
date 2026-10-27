@@ -1,0 +1,204 @@
+---
+# The dedicated sandbox ssh-agent (scenario 4, concepts/SSH Agent
+# Forwarding): a user service with its own socket, holding only the egress
+# key and a short-lived certificate Vault's SSH CA signs for the SCP target's
+# principal. lab_ssh forwards it into the dev session on the sandbox VM; the
+# guest can ask it to sign while that session is open, and can never read the
+# key. Runs as the operator: no become.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - sandbox_ssh_agent_socket is defined and sandbox_ssh_agent_socket is match('^/run/user/\d+/[^/ ]+/[^/ ]+\.sock$')
+      - sandbox_ssh_agent_vault_socket is defined and sandbox_ssh_agent_vault_socket is match('^/[^ ]+\.sock$')
+      - sandbox_ssh_agent_operator_dir is defined and sandbox_ssh_agent_operator_dir is match('^/[^ ]+$')
+      - sandbox_ssh_agent_principal is defined and sandbox_ssh_agent_principal is match('^[a-z][a-z0-9-]*$')
+      - sandbox_ssh_agent_ttl is defined and sandbox_ssh_agent_ttl is match('^\d+[mh]$')
+      - sandbox_ssh_agent_ssh_mount is defined and sandbox_ssh_agent_ssh_mount is match('^[a-z0-9-]+$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        sandbox_ssh_agent_socket        /run/user/<uid>/<dir>/<name>.sock (SANDBOX_AGENT_SOCK)
+        sandbox_ssh_agent_vault_socket  vault_server's unix socket (the operator opens it by ACL)
+        sandbox_ssh_agent_operator_dir  OPERATOR_DIR (the Vault operator token, the helper)
+        sandbox_ssh_agent_principal     the SCP target's user, the certificate's only principal
+        sandbox_ssh_agent_ttl           certificate lifetime, <n>m or <n>h
+        sandbox_ssh_agent_ssh_mount     vault_gateway's SSH CA mount
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      {{ sandbox_ssh_agent_socket }}: {{ sandbox_ssh_agent_key }} for {{ sandbox_ssh_agent_principal }}
+      ({{ sandbox_ssh_agent_ttl }})
+
+- name: Assert the socket is in this user's runtime directory
+  ansible.builtin.assert:
+    that: sandbox_ssh_agent_socket.startswith('/run/user/' ~ ansible_facts['user_uid'] ~ '/')
+    fail_msg: "{{ sandbox_ssh_agent_socket }} is not under /run/user/{{ ansible_facts['user_uid'] }}"
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Create the directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - "{{ sandbox_ssh_agent_key | dirname }}"
+    - "{{ sandbox_ssh_agent_unit_dir }}"
+    - "{{ sandbox_ssh_agent_helper | dirname }}"
+
+- name: Check whether the directories exist
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ sandbox_ssh_agent_key | dirname }}"
+    - "{{ sandbox_ssh_agent_unit_dir }}"
+    - "{{ sandbox_ssh_agent_helper | dirname }}"
+  register: sandbox_ssh_agent_dirs
+
+- name: Decide whether the key and unit tasks can run
+  ansible.builtin.set_fact:
+    sandbox_ssh_agent_ready: >-
+      {{ not ansible_check_mode or (sandbox_ssh_agent_dirs.results | map(attribute='stat.exists') | min) }}
+
+- name: Would create the egress key, the helper and the agent service
+  ansible.builtin.debug:
+    msg: "{{ sandbox_ssh_agent_key }}, {{ sandbox_ssh_agent_helper }}, {{ sandbox_ssh_agent_unit }}"
+  changed_when: true
+  when: not sandbox_ssh_agent_ready
+
+- name: Install the sandbox agent
+  when: sandbox_ssh_agent_ready
+  block:
+    - name: Create the egress key pair (never leaves this host)
+      community.crypto.openssh_keypair:
+        path: "{{ sandbox_ssh_agent_key }}"
+        type: ed25519
+        comment: ai-sandbox egress
+        mode: "0600"
+        regenerate: never
+
+    - name: Install the certificate helper
+      ansible.builtin.template:
+        src: ai-sandbox-agent-cert.j2
+        dest: "{{ sandbox_ssh_agent_helper }}"
+        mode: "0755"
+
+    - name: Install the agent's user unit
+      ansible.builtin.template:
+        src: ai-sandbox-ssh-agent.service.j2
+        dest: "{{ sandbox_ssh_agent_unit_dir }}/{{ sandbox_ssh_agent_unit }}"
+        mode: "0644"
+      register: sandbox_ssh_agent_unit_file
+
+    - name: Enable and start the agent
+      ansible.builtin.systemd_service:
+        name: "{{ sandbox_ssh_agent_unit }}"
+        scope: user
+        enabled: true
+        state: "{{ 'restarted' if sandbox_ssh_agent_unit_file is changed else 'started' }}"
+        daemon_reload: true
+
+# check-mode: read-only, so it runs in a dry run too.
+- name: Read the certificate's remaining validity
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import datetime, re, subprocess, sys
+        out = subprocess.run(["ssh-keygen", "-L", "-f", sys.argv[1]], capture_output=True, text=True).stdout
+        m = re.search(r"Valid: from \S+ to (\S+)", out)
+        print(int((datetime.datetime.fromisoformat(m[1]) - datetime.datetime.now()).total_seconds()) if m else -1)
+      - "{{ sandbox_ssh_agent_cert }}"
+  register: sandbox_ssh_agent_remaining
+  changed_when: false
+  check_mode: false
+
+# check-mode: read-only, so it runs in a dry run too.
+- name: List the agent's identities
+  ansible.builtin.command: ssh-add -L
+  environment:
+    SSH_AUTH_SOCK: "{{ sandbox_ssh_agent_socket }}"
+  register: sandbox_ssh_agent_listed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Decide whether the certificate needs signing and loading
+  ansible.builtin.set_fact:
+    sandbox_ssh_agent_sign: >-
+      {{ sandbox_ssh_agent_remaining.stdout | int < sandbox_ssh_agent_min_seconds
+         or 'ssh-ed25519-cert-v01@openssh.com' not in sandbox_ssh_agent_listed.stdout }}
+
+- name: Would have Vault sign the egress key and load it into the agent
+  ansible.builtin.debug:
+    msg: "{{ sandbox_ssh_agent_helper }}"
+  changed_when: true
+  when: sandbox_ssh_agent_sign and ansible_check_mode
+
+- name: Have Vault sign the egress key and load it into the agent
+  ansible.builtin.command: "{{ sandbox_ssh_agent_helper }}"
+  register: sandbox_ssh_agent_signed
+  changed_when: true
+  when: sandbox_ssh_agent_sign and not ansible_check_mode
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the agent holds the certificate, signed for the principal.
+# Skipped only in a dry run that would sign.
+# ---------------------------------------------------------------------------
+- name: Read the certificate
+  ansible.builtin.command: ssh-keygen -L -f {{ sandbox_ssh_agent_cert }}
+  register: sandbox_ssh_agent_cert_text
+  changed_when: false
+  check_mode: false
+  when: not (sandbox_ssh_agent_sign and ansible_check_mode)
+
+- name: List the agent's identities again
+  ansible.builtin.command: ssh-add -L
+  environment:
+    SSH_AUTH_SOCK: "{{ sandbox_ssh_agent_socket }}"
+  register: sandbox_ssh_agent_verify
+  changed_when: false
+  check_mode: false
+  when: not (sandbox_ssh_agent_sign and ansible_check_mode)
+
+- name: Assert the agent holds the certificate for the principal only
+  ansible.builtin.assert:
+    that:
+      - "'ssh-ed25519-cert-v01@openssh.com' in sandbox_ssh_agent_verify.stdout"
+      - >-
+        sandbox_ssh_agent_cert_text.stdout
+        is search('Principals:\s*\n\s*' ~ sandbox_ssh_agent_principal ~ '\s*\n\s*Critical')
+    fail_msg: "{{ sandbox_ssh_agent_verify.stdout }} / {{ sandbox_ssh_agent_cert_text.stdout }}"
+    success_msg: "{{ sandbox_ssh_agent_cert_text.stdout_lines | select('search', 'Valid:') | first | trim }}"
+  when: not (sandbox_ssh_agent_sign and ansible_check_mode)
+...

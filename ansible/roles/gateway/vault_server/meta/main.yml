@@ -1,0 +1,20 @@
+---
+galaxy_info:
+  author: infrashift
+  description: >-
+    A single-node Vault server on loopback (raft storage), initialised and auto-unsealed, on the Linux
+    x86_64 host
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - vault
+    - hashicorp
+    - linux
+
+dependencies: []
+...

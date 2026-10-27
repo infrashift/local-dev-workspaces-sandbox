@@ -1,0 +1,64 @@
+# {{ ansible_managed }}
+[Unit]
+Description=HashiCorp Vault (ai-sandbox, loopback only)
+Documentation=https://developer.hashicorp.com/vault/docs
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty={{ vault_server_config }}
+
+[Service]
+Type=notify
+User={{ vault_server_user }}
+Group={{ vault_server_user }}
+# The socket's directory. Vault creates the socket owner-only (its server
+# listener ignores socket_mode/socket_group); once it is ready, root hands the
+# socket to {{ vault_server_socket_group }} (0660) and, by ACL, the operators.
+RuntimeDirectory={{ vault_server_socket | dirname | basename }}
+RuntimeDirectoryMode=0755
+ExecStartPost=+{{ vault_server_socket_script }} {{ vault_server_socket }} {{ vault_server_socket_group }} {{ vault_server_operators | join(' ') }}
+ExecStart={{ vault_server_bin }} server -config={{ vault_server_config }}
+ExecReload=/bin/kill --signal HUP $MAINPID
+KillMode=process
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+Environment=VAULT_DISABLE_USER_LOCKOUT=false
+# Sandboxing: systemd-analyze security scores it, and the role asserts that score.
+ProtectSystem=strict
+ReadWritePaths={{ vault_server_data_dir }} {{ vault_server_audit_dir }}
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+KeyringMode=private
+DevicePolicy=closed
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+MemoryDenyWriteExecute=yes
+# A unix socket is all Vault serves.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+CapabilityBoundingSet=
+SecureBits=keep-caps
+
+[Install]
+WantedBy=multi-user.target

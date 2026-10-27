@@ -1,0 +1,167 @@
+---
+# tmux, a system-wide configuration, and `dev-session`: an editor | shell
+# layout that a login can start automatically. System lane: the hook that
+# starts the layout is root-owned, so the account it starts for cannot rewrite
+# it.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - tmux_variant in tmux_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      tmux supports {{ tmux_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ tmux_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: tmux_whoami
+  changed_when: false
+  check_mode: false
+
+- name: Assert that the role runs in the system lane
+  ansible.builtin.assert:
+    that: tmux_whoami.stdout == 'root'
+    fail_msg: >-
+      tmux writes system state and must run as root: apply it from a play with
+      become: true (it ran as {{ tmux_whoami.stdout }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - tmux_session_name is defined and tmux_session_name | length > 0
+      - tmux_editor_pane_command is defined and tmux_editor_pane_command | length > 0
+      - tmux_shell_pane_percent is defined and tmux_shell_pane_percent | string | length > 0
+      - tmux_autostart is defined and tmux_autostart in ['interactive', 'ssh', 'never']
+      # SHAPE VALIDATION. These values are rendered into a shell script that
+      # runs on every interactive login, so their character set is restricted
+      # rather than trusted to quoting alone. tmux also rejects '.' and ':' in
+      # a session name, because both are target separators.
+      - tmux_session_name is match('^[A-Za-z0-9_-]+$')
+      - tmux_editor_pane_command is match('^[A-Za-z0-9_./ =+,@-]+$')
+      - tmux_shell_pane_percent | string is match('^\d+$')
+      - tmux_shell_pane_percent | int >= 10 and tmux_shell_pane_percent | int <= 90
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        tmux_session_name         letters, digits, '_' and '-' only
+        tmux_editor_pane_command  letters, digits, spaces and _ . / = + , @ - only (e.g. nvim)
+        tmux_shell_pane_percent   digits only, between 10 and 90
+        tmux_autostart            interactive | ssh | never
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      session '{{ tmux_session_name }}': {{ tmux_editor_pane_command }} |
+      shell {{ tmux_shell_pane_percent }}%, autostart={{ tmux_autostart }}
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS — everything written here is root-owned.
+# ---------------------------------------------------------------------------
+- name: Install {{ tmux_packages | join(', ') }}
+  ansible.builtin.package:
+    name: "{{ tmux_packages }}"
+    state: present
+  register: tmux_installed
+
+# /etc/tmux.conf is tmux's system-wide file: it is read before ~/.tmux.conf,
+# so a developer's own configuration still wins.
+- name: Write the system-wide tmux configuration
+  ansible.builtin.template:
+    src: tmux.conf.j2
+    dest: "{{ tmux_conf_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: tmux_conf
+
+- name: Install the dev-session command
+  ansible.builtin.template:
+    src: dev-session.sh.j2
+    dest: "{{ tmux_session_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+    validate: bash -n %s
+
+- name: Install the dev-session login hook
+  ansible.builtin.template:
+    src: dev-session.profile.sh.j2
+    dest: "{{ tmux_profile_hook }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: bash -n %s
+
+# ---------------------------------------------------------------------------
+# VERIFICATION. tmux cannot attach here, but it can parse the configuration
+# on a private socket. Skipped in a dry run that would install or rewrite it.
+# ---------------------------------------------------------------------------
+- name: Verify tmux and its configuration
+  when: not (ansible_check_mode and (tmux_installed is changed or tmux_conf is changed))
+  block:
+    - name: Get the installed tmux version
+      ansible.builtin.command: tmux -V
+      register: tmux_version_result
+      changed_when: false
+      check_mode: false
+
+    # `source-file -n` parses without applying. -L gives this check its own
+    # server socket, so it can never touch a session someone is actually
+    # using, and kill-server removes it again whatever the parse said.
+    - name: Validate the system-wide tmux configuration
+      ansible.builtin.command:
+        argv:
+          - tmux
+          - -L
+          - role-validate
+          - -f
+          - /dev/null
+          - start-server
+          - ;
+          - source-file
+          - -n
+          - "{{ tmux_conf_path }}"
+          - ;
+          - kill-server
+      register: tmux_conf_validate
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Check that the tmux-256color terminal description is installed
+      ansible.builtin.command: infocmp tmux-256color
+      register: tmux_terminfo
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Assert that tmux is installed and its configuration loads
+      ansible.builtin.assert:
+        that:
+          - tmux_version_result.stdout is match('^tmux \d')
+          - tmux_conf_validate.rc == 0
+          - tmux_terminfo.rc == 0
+        fail_msg: >-
+          tmux is not usable. `tmux -V` said '{{ tmux_version_result.stdout }}';
+          {{ tmux_conf_path }} parse rc={{ tmux_conf_validate.rc }}
+          ({{ tmux_conf_validate.stderr }});
+          infocmp tmux-256color rc={{ tmux_terminfo.rc }}.
+        success_msg: "{{ tmux_version_result.stdout }} installed; {{ tmux_conf_path }} and tmux-256color validated."
+...

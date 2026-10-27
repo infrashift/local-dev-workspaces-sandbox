@@ -1,0 +1,30 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries are asserted against their prerequisites rather than assumed.
+grype_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+grype_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS — not caller-settable.
+#
+# anchore publishes assets under amd64 / arm64. The architecture is never
+# guessed: a wrong one would install a binary that then passes its own
+# checksum from the upstream checksums file.
+# ---------------------------------------------------------------------------
+grype_home: "{{ ansible_facts['user_dir'] }}"
+grype_bin_dir: "{{ grype_home }}/.local/bin"
+grype_arch: "{{ {'aarch64': 'arm64', 'x86_64': 'amd64'}[ansible_facts['architecture']] }}"
+grype_tarball: "grype_{{ grype_version }}_linux_{{ grype_arch }}.tar.gz"
+grype_checksums_file: "grype_{{ grype_version }}_checksums.txt"
+grype_release_url: "https://github.com/anchore/grype/releases/download/v{{ grype_version }}"
+grype_download_url: "{{ grype_release_url }}/{{ grype_tarball }}"
+grype_checksums_download_url: "{{ grype_release_url }}/{{ grype_checksums_file }}"
+grype_install_root: "{{ grype_home }}/.local/share/grype"
+grype_install_dir: "{{ grype_install_root }}/{{ grype_version }}"
+grype_version_pattern: "(?m)^Version:\\s+{{ grype_version | regex_escape }}$"
+...

@@ -1,0 +1,53 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Vault Proxy for the ai-sandbox gateway (unix socket only)
+Documentation=https://developer.hashicorp.com/vault/docs/agent-and-proxy/proxy
+After=vault.service ai-sandbox-vault-unseal.service
+Wants=ai-sandbox-vault-unseal.service
+
+[Service]
+User={{ vault_proxy_user }}
+Group={{ vault_proxy_user }}
+# Membership in its own socket's group lets Vault Proxy hand that socket to
+# it; {{ vault_proxy_vault_group }} opens Vault's.
+SupplementaryGroups={{ vault_proxy_socket_group }} {{ vault_proxy_vault_group }}
+RuntimeDirectory=vault-proxy
+RuntimeDirectoryMode=0755
+ExecStartPre=/bin/rm -f {{ vault_proxy_socket }}
+ExecStart={{ vault_proxy_bin }} proxy -config={{ vault_proxy_config }}
+Restart=on-failure
+RestartSec=5
+# Sandboxing: systemd-analyze security scores it, and the role asserts that score.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+KeyringMode=private
+DevicePolicy=closed
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+MemoryDenyWriteExecute=yes
+# Unix sockets both ways: Envoy's side and Vault's.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

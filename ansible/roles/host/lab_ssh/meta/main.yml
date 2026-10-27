@@ -1,0 +1,17 @@
+---
+galaxy_info:
+  author: infrashift
+  description: Per-lab SSH key pairs and host configs for ai-sandbox VMs
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - ssh
+    - linux
+
+dependencies: []
+...

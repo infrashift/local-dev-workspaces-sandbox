@@ -1,0 +1,11 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none. The SSH directory follows the
+# user running the bootstrap, so it is derived from that user's HOME.
+# ---------------------------------------------------------------------------
+lab_ssh_dir: "{{ ansible_facts['env']['HOME'] }}/.ssh"
+lab_ssh_key_dir: "{{ lab_ssh_dir }}/key.d"
+lab_ssh_config_dir: "{{ lab_ssh_dir }}/config.d"
+lab_ssh_include_line: "Include config.d/*"
+...

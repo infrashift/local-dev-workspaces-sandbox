@@ -1,0 +1,175 @@
+---
+# The baseline every lab VM gets, whatever stack goes on top:
+#
+#   sandbox VMs (dev_ws), which reach the outside only through the gateway:
+#     1. wait for SSH and for cloud-init (users, growpart);
+#     2. trust the TLS-inspecting proxy's chain, if there is one (ca_trust,
+#        optional): the tunnel's sites then present the proxy's certificates;
+#     3. point every egress at the gateway (sandbox_egress) -- before anything
+#        on the guest touches the network but 2's probes, which use the
+#        play's proxy environment;
+#     4. trust the gateway CA (ca_trust), so the TLS gateway's github.com,
+#        api.anthropic.com, ... verify;
+#     5. the dnf Python bindings, a full upgrade, and the lab's base packages.
+#   upstream VMs (the trusted test fixtures, on the NAT network): 1, 2 and 5.
+#
+# Terraform runs it, through site.yml, once the VMs have their DHCP leases.
+# Re-run it with a dry run and a "yes" confirmation:
+#
+#   make -f lab-provision.mk ansible            (= play PLAYBOOK=site)
+#
+# Both pass lab-config.mk's lab values as extra vars (gateway_ip, proxy_port,
+# ca_trust_dir, tls_inspection_dir, ...). Stacks such as python-stack.yml import
+# this playbook first.
+- name: Baseline the sandbox VMs
+  hosts: dev_ws
+  gather_facts: false
+  become: true
+  environment: "{{ sandbox_proxy_env }}"
+
+  vars_files:
+    - ../vars/gateway.yml
+
+  vars:
+    # What the sandbox must reach once its trust is in place: the TLS gateway
+    # (github.com, anonymous) and the tunnel (the pinned mirror, PyPI, a
+    # registry, Claude Code's release bucket). ca_trust probes each over
+    # verified TLS.
+    trust_probe_urls:
+      - https://github.com/
+      - "{{ sandbox_fedora_mirror }}/"
+      - https://pypi.org/
+      - https://quay.io/v2/
+      - https://downloads.claude.ai/claude-code-releases/stable
+    # Behind a TLS-inspecting proxy, the tunnel's sites: the gateway's own
+    # hosts are not reachable before the gateway CA is trusted.
+    inspection_probe_urls: >-
+      {{ trust_probe_urls | reject('search', '^https://(' ~ (gateway_routes | map(attribute='host')
+         | map('regex_escape') | join('|')) ~ ')/') | list }}
+
+  pre_tasks:
+    - name: Assert the lab values were passed
+      ansible.builtin.assert:
+        that:
+          - gateway_ip is defined and proxy_port is defined
+          - ca_trust_dir is defined and ca_trust_dir | length > 0
+          - tls_inspection_dir is defined and tls_inspection_dir | length > 0
+        fail_msg: >-
+          Pass lab-config.mk's lab values: terraform apply and lab-provision.mk do so as
+          --extra-vars '<LAB_VARS>'. Running ansible-playbook by hand needs the same.
+        quiet: true
+      tags: [always]
+
+    - name: Wait for SSH connectivity
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    # rc 0: done. rc 2: done with recoverable errors -- on Fedora 44 cloud-init's
+    # first `hostnamectl set-hostname` runs before D-Bus is up and fails, though
+    # the hostname is set moments later. rc 1: cloud-init failed; stop here.
+    - name: Wait for cloud-init to finish (users, growpart)
+      ansible.builtin.command: cloud-init status --wait --long
+      register: baseline_cloud_init
+      changed_when: false
+      failed_when: baseline_cloud_init.rc not in [0, 2]
+      check_mode: false
+
+    - name: Report cloud-init's recoverable errors
+      ansible.builtin.debug:
+        msg: "{{ baseline_cloud_init.stdout_lines }}"
+      when: baseline_cloud_init.rc == 2
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Assert this is a Fedora 44 x86_64 guest
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['architecture'] == 'x86_64'
+          - ansible_facts['distribution'] == 'Fedora'
+          - ansible_facts['distribution_major_version'] == '44'
+        fail_msg: >-
+          Expected Fedora 44 x86_64, got {{ ansible_facts['distribution'] }}
+          {{ ansible_facts['distribution_major_version'] }} {{ ansible_facts['architecture'] }}
+
+  roles:
+    # Optional: an empty or missing TLS_INSPECTION_DIR removes its anchors.
+    - role: ca_trust
+      ca_trust_src_dir: "{{ tls_inspection_dir }}"
+      ca_trust_name: ai-sandbox-tls-inspection
+      ca_trust_required: false
+      ca_trust_probe_urls: "{{ inspection_probe_urls }}"
+
+    - role: sandbox_egress
+      sandbox_egress_gateway_ip: "{{ gateway_ip }}"
+      sandbox_egress_proxy_port: "{{ proxy_port }}"
+      sandbox_egress_gateway_hosts: "{{ gateway_routes | map(attribute='host') | list }}"
+      sandbox_egress_fedora_mirror: "{{ sandbox_fedora_mirror }}"
+
+    - role: ca_trust
+      ca_trust_src_dir: "{{ ca_trust_dir }}"
+      ca_trust_name: ai-sandbox-gateway
+      ca_trust_required: true
+      ca_trust_probe_urls: "{{ trust_probe_urls }}"
+
+    - role: system_packages
+      system_packages_list: "{{ dev_packages }}"
+      system_packages_upgrade: true
+
+- name: Baseline the upstream fixtures
+  hosts: upstream
+  gather_facts: false
+  become: true
+
+  vars:
+    # What upstream-1 reaches directly, over the NAT network: dnf's metalink
+    # and the GitHub API its GitHub MCP server calls.
+    trust_probe_urls:
+      - https://mirrors.fedoraproject.org/
+      - https://api.github.com/
+
+  pre_tasks:
+    - name: Assert the lab values were passed
+      ansible.builtin.assert:
+        that: tls_inspection_dir is defined and tls_inspection_dir | length > 0
+        fail_msg: >-
+          Pass lab-config.mk's lab values: terraform apply and lab-provision.mk do so as
+          --extra-vars '<LAB_VARS>'. Running ansible-playbook by hand needs the same.
+        quiet: true
+      tags: [always]
+
+    - name: Wait for SSH connectivity
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Wait for cloud-init to finish (users, growpart)
+      ansible.builtin.command: cloud-init status --wait --long
+      register: baseline_cloud_init
+      changed_when: false
+      failed_when: baseline_cloud_init.rc not in [0, 2]
+      check_mode: false
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Assert this is a Fedora 44 x86_64 guest
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['architecture'] == 'x86_64'
+          - ansible_facts['distribution'] == 'Fedora'
+          - ansible_facts['distribution_major_version'] == '44'
+        fail_msg: >-
+          Expected Fedora 44 x86_64, got {{ ansible_facts['distribution'] }}
+          {{ ansible_facts['distribution_major_version'] }} {{ ansible_facts['architecture'] }}
+
+  roles:
+    - role: ca_trust
+      ca_trust_src_dir: "{{ tls_inspection_dir }}"
+      ca_trust_name: ai-sandbox-tls-inspection
+      ca_trust_required: false
+      ca_trust_probe_urls: "{{ trust_probe_urls }}"
+
+    - role: system_packages
+      system_packages_list: "{{ upstream_packages }}"
+      system_packages_upgrade: true
+...

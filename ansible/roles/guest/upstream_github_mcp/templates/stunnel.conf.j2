@@ -1,0 +1,14 @@
+; {{ ansible_managed }}
+; TLS for the GitHub MCP server. stunnel starts as root to read the key, then
+; drops to {{ upstream_github_mcp_stunnel_user }}. foreground: systemd supervises and logs it;
+; pid = (empty): no pid file.
+foreground = yes
+pid =
+setuid = {{ upstream_github_mcp_stunnel_user }}
+setgid = {{ upstream_github_mcp_stunnel_user }}
+[github-mcp]
+accept = 0.0.0.0:{{ upstream_github_mcp_port }}
+connect = 127.0.0.1:{{ upstream_github_mcp_backend_port }}
+cert = {{ upstream_github_mcp_cert }}
+key = {{ upstream_github_mcp_key }}
+sslVersionMin = TLSv1.2

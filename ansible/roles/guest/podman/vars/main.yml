@@ -1,0 +1,32 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries are asserted against their prerequisites rather than assumed.
+podman_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+podman_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS — not caller-settable.
+# ---------------------------------------------------------------------------
+# passt provides pasta, rootless podman's default network on Fedora 40+ and
+# EL 9.5+.
+podman_packages:
+  - podman
+  - passt
+
+# 65536 ids map a whole container user namespace (uid 0 is the account
+# itself; the range covers the rest).
+podman_subid_min: 65536
+
+# podman_uid/podman_home are looked up with getent (rootless only).
+podman_socket_path: >-
+  {{ '/run/user/' ~ podman_uid ~ '/podman/podman.sock' if podman_mode == 'rootless' else '/run/podman/podman.sock' }}
+podman_info_argv: >-
+  {{ (['runuser', '-u', podman_rootless_user, '--', 'env', 'HOME=' ~ podman_home,
+       'XDG_RUNTIME_DIR=/run/user/' ~ podman_uid] if podman_mode == 'rootless' else [])
+     + ['podman', 'info', '--format', 'json'] }}
+...

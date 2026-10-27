@@ -1,0 +1,25 @@
+---
+# Ported from: new (ai-sandbox)
+galaxy_info:
+  author: infrashift
+  description: Podman for Fedora and EL guests, configured rootful or rootless
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Fedora
+      versions:
+        - "44"
+    - name: EL
+      versions:
+        - "9"
+        - "10"
+  galaxy_tags:
+    - podman
+    - containers
+    - rootless
+    - fedora
+    - rhel
+
+dependencies: []
+...

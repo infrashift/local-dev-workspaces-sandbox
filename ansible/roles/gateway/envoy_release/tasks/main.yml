@@ -1,0 +1,214 @@
+---
+# The Envoy proxy from its GitHub release, verified end to end, only if the
+# pinned version is not already installed:
+#   1. checksums.txt.asc must carry a valid clearsignature from the PINNED
+#      maintainers' key;
+#   2. the linux binary must match the SHA-256 in the signed text.
+# The binary lands in envoy_release_dest only after every check passes. A
+# system-wide dest (/usr/local/bin) needs `become: true` on the role entry.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - envoy_release_version is defined and envoy_release_version is match('^\d+\.\d+\.\d+$')
+      # The checksums must be signed by exactly this key, not merely by some
+      # key in the downloaded keyring.
+      - envoy_release_key_fpr is defined and envoy_release_key_fpr is match('^[0-9A-Fa-f]{40}$')
+      - envoy_release_dest is defined and envoy_release_dest is match('^/[^ ]+$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        envoy_release_version  X.Y.Z (a stable release)
+        envoy_release_key_fpr  the Envoy maintainers' 40-hex-digit key fingerprint, pinned from
+                               https://github.com/envoyproxy/envoy/blob/main/releases.asc
+        envoy_release_dest     absolute install directory
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "{{ envoy_release_label }} -> {{ envoy_release_dest }} (checksums signed by {{ envoy_release_key_fpr }})"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Check the installed version of envoy
+  ansible.builtin.command: "{{ envoy_release_dest }}/envoy --version"
+  register: envoy_release_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Decide whether to install {{ envoy_release_label }}"
+  ansible.builtin.set_fact:
+    envoy_release_needed: >-
+      {{ envoy_release_installed.rc != 0 or envoy_release_installed.stdout is not search(envoy_release_version_re) }}
+
+- name: "Would download, GPG/SHA-256 verify and install {{ envoy_release_label }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ envoy_release_base_url }}/{{ envoy_release_asset }} -> {{ envoy_release_dest }}/envoy
+      (checksums signed by {{ envoy_release_key_fpr }})
+  changed_when: true
+  when: envoy_release_needed and ansible_check_mode
+
+- name: "Install {{ envoy_release_label }}"
+  when: envoy_release_needed and not ansible_check_mode
+  block:
+    - name: Create a scratch directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -envoy
+      register: envoy_release_tmp
+
+    # Neither can verify itself; the signature check below covers the
+    # checksums, and the pinned fingerprint covers the keyring.
+    - name: Download the signed checksums file and the maintainers' keyring
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "{{ envoy_release_tmp.path }}/{{ item.name }}"
+        mode: "0644"
+      loop:
+        - { url: "{{ envoy_release_base_url }}/{{ envoy_release_sums }}", name: checksums.txt.asc }
+        - { url: "{{ envoy_release_key_url }}", name: releases.asc }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Create a throwaway GnuPG home (leaves ~/.gnupg alone)
+      ansible.builtin.file:
+        path: "{{ envoy_release_tmp.path }}/gnupg"
+        state: directory
+        mode: "0700"
+
+    - name: Dearmor the keyring for gpgv
+      ansible.builtin.command:
+        argv:
+          - "{{ envoy_release_gpg }}"
+          - --homedir={{ envoy_release_tmp.path }}/gnupg
+          - --batch
+          - --dearmor
+          - --output={{ envoy_release_tmp.path }}/envoy.gpg
+          - "{{ envoy_release_tmp.path }}/releases.asc"
+        creates: "{{ envoy_release_tmp.path }}/envoy.gpg"
+
+    # --status-fd reports which key signed; --output keeps only the signed
+    # text, so nothing appended outside the signature can add a hash. Envoy's
+    # signatures carry a binary notation that gpgv prints raw, which Ansible
+    # cannot hold, so only the signature lines are kept (grep -a: binary-safe;
+    # pipefail keeps gpgv's own exit status).
+    - name: Verify the checksums signature
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          {{ envoy_release_gpgv }} --status-fd=1
+          --keyring={{ envoy_release_tmp.path }}/envoy.gpg
+          --output={{ envoy_release_tmp.path }}/checksums.txt
+          {{ envoy_release_tmp.path }}/checksums.txt.asc 2>/dev/null
+          | grep -a -E '^\[GNUPG:\] (VALIDSIG|GOODSIG|BADSIG|ERRSIG|EXPKEYSIG|REVKEYSIG) '
+        executable: /bin/bash
+      register: envoy_release_gpgv_out
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the signature is valid and made under the pinned key
+      ansible.builtin.assert:
+        that:
+          - envoy_release_gpgv_out.rc == 0
+          - >-
+            envoy_release_gpgv_out.stdout is search('(?m)^\[GNUPG:\] VALIDSIG [0-9A-F]{40} .* '
+            ~ (envoy_release_key_fpr | upper) ~ '$')
+        fail_msg: >-
+          {{ envoy_release_sums }} is not validly signed under the pinned key {{ envoy_release_key_fpr }}
+          (gpgv rc={{ envoy_release_gpgv_out.rc }}): {{ envoy_release_gpgv_out.stdout }}
+          {{ envoy_release_gpgv_out.stderr }}
+        success_msg: "Good signature under {{ envoy_release_key_fpr }}"
+
+    - name: Read the signed checksums
+      ansible.builtin.slurp:
+        src: "{{ envoy_release_tmp.path }}/checksums.txt"
+      register: envoy_release_signed
+
+    # Anchored to the whole asset name, so the contrib build's line cannot answer.
+    - name: "Extract the SHA-256 of {{ envoy_release_asset }}"
+      ansible.builtin.set_fact:
+        envoy_release_sha256: >-
+          {{ envoy_release_signed.content | b64decode
+             | regex_search('(?m)^([0-9a-f]{64})\s+\*?' ~ (envoy_release_asset | regex_escape) ~ '$', '\1')
+             | default([''], true) | first }}
+
+    # An empty digest would make get_url skip verification rather than fail it.
+    - name: Assert the signed checksums list the binary
+      ansible.builtin.assert:
+        that: envoy_release_sha256 is match('^[0-9a-f]{64}$')
+        fail_msg: "No SHA-256 for {{ envoy_release_asset }} in the signed {{ envoy_release_sums }}"
+        quiet: true
+
+    - name: "Download the binary, verified against the signed SHA-256: {{ envoy_release_asset }}"
+      ansible.builtin.get_url:
+        url: "{{ envoy_release_base_url }}/{{ envoy_release_asset }}"
+        dest: "{{ envoy_release_tmp.path }}/envoy"
+        checksum: "sha256:{{ envoy_release_sha256 }}"
+        mode: "0755"
+        timeout: 120
+
+    - name: Ensure the destination directory exists
+      ansible.builtin.file:
+        path: "{{ envoy_release_dest }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Install into {{ envoy_release_dest }}"
+      ansible.builtin.copy:
+        src: "{{ envoy_release_tmp.path }}/envoy"
+        dest: "{{ envoy_release_dest }}/envoy"
+        remote_src: true
+        mode: "0755"
+
+  always:
+    - name: Remove the scratch directory
+      ansible.builtin.file:
+        path: "{{ envoy_release_tmp.path }}"
+        state: absent
+      when: envoy_release_tmp.path is defined
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the REQUESTED version, not merely a binary that runs.
+# Skipped only in a dry run that would install.
+# ---------------------------------------------------------------------------
+- name: Verify the installed version of envoy
+  ansible.builtin.command: "{{ envoy_release_dest }}/envoy --version"
+  register: envoy_release_verify
+  changed_when: false
+  check_mode: false
+  when: not (envoy_release_needed and ansible_check_mode)
+
+- name: "Assert that the requested version is installed: {{ envoy_release_label }}"
+  ansible.builtin.assert:
+    that: envoy_release_verify.stdout is search(envoy_release_version_re)
+    fail_msg: "Expected {{ envoy_release_label }}; envoy --version said: {{ envoy_release_verify.stdout }}"
+    success_msg: "{{ envoy_release_verify.stdout | trim }}"
+  when: not (envoy_release_needed and ansible_check_mode)
+...

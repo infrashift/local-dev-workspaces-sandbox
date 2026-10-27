@@ -1,0 +1,20 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none.
+# ---------------------------------------------------------------------------
+# Every API call goes to Consul's unix socket; the URL's host is a placeholder.
+consul_egress_url: http://localhost
+consul_egress_read_policy: ai-sandbox-egress-read
+consul_egress_operator_policy: ai-sandbox-egress-operator
+consul_egress_operator_token_file: "{{ consul_egress_operator_dir }}/consul-operator.token"
+consul_egress_policies:
+  - name: "{{ consul_egress_read_policy }}"
+    rules: |
+      key_prefix "{{ consul_egress_kv_prefix }}/" { policy = "read" }
+  # The operator edits allow/ and reads baseline/; baseline/ belongs to Ansible.
+  - name: "{{ consul_egress_operator_policy }}"
+    rules: |
+      key_prefix "{{ consul_egress_kv_prefix }}/" { policy = "read" }
+      key_prefix "{{ consul_egress_kv_prefix }}/allow/" { policy = "write" }
+...

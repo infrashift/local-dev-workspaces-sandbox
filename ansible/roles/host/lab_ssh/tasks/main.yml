@@ -1,0 +1,184 @@
+---
+# Per-lab SSH identities and host configs:
+#   ~/.ssh/key.d/local.<lab>@<role>      ed25519 key pair, never regenerated
+#   ~/.ssh/config.d/local.<lab>@<role>   Host local.<lab>.<role>[.<vm>]
+# Only the dev alias of the default (sandbox) VM forwards an ssh-agent: the
+# dedicated sandbox agent, never the operator's own (concepts/SSH Agent
+# Forwarding).
+# The Host aliases use "." rather than "@": ssh splits user@host on the
+# command line, so an alias containing "@" could never be matched.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - lab_ssh_lab_name is defined and lab_ssh_lab_name is match('^[a-z0-9][a-z0-9_-]*$')
+      - lab_ssh_roles is defined and lab_ssh_roles is sequence and lab_ssh_roles is not string
+      - lab_ssh_roles | length > 0
+      - lab_ssh_roles | difference(['admin', 'dev']) | length == 0
+      - lab_ssh_vm_proxy is defined and lab_ssh_vm_proxy is match('^/[^ ]+$')
+      - lab_ssh_default_vm is defined and lab_ssh_default_vm is match('^[a-z0-9][a-z0-9-]*$')
+      - lab_ssh_agent_socket is defined and lab_ssh_agent_socket is match('^/[^ ]+$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        lab_ssh_lab_name          lowercase letters, digits, '_' and '-' (the lab directory name)
+        lab_ssh_roles             non-empty list, each one of: admin, dev (the cloud-init users)
+        lab_ssh_vm_proxy          absolute path to terraform/modules/libvirt-vm/scripts/vm-proxy.sh
+        lab_ssh_default_vm        the VM an alias without .<vm> reaches (the sandbox VM)
+        lab_ssh_agent_socket      absolute path of the sandbox ssh-agent socket the dev alias forwards
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "local.{{ lab_ssh_lab_name }}@{{ lab_ssh_roles | join(',') }} in {{ lab_ssh_dir }}"
+
+# The ProxyCommand runs this script on every connection; a typo here would
+# only surface as an opaque ssh failure long after this role "succeeded".
+- name: Stat the VM ProxyCommand script
+  ansible.builtin.stat:
+    path: "{{ lab_ssh_vm_proxy }}"
+  register: lab_ssh_vm_proxy_stat
+
+- name: Assert the VM ProxyCommand script exists and is executable
+  ansible.builtin.assert:
+    that: lab_ssh_vm_proxy_stat.stat.exists and lab_ssh_vm_proxy_stat.stat.executable
+    fail_msg: "{{ lab_ssh_vm_proxy }} is missing or not executable"
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Create ~/.ssh, key.d and config.d
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - "{{ lab_ssh_dir }}"
+    - "{{ lab_ssh_key_dir }}"
+    - "{{ lab_ssh_config_dir }}"
+
+# In a dry run on a fresh host the directories above do not exist yet, so
+# the key and config tasks would fail; report what they would create instead.
+- name: Check whether key.d and config.d exist
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ lab_ssh_key_dir }}"
+    - "{{ lab_ssh_config_dir }}"
+  register: lab_ssh_dirs
+
+- name: Decide whether the key and config tasks can run
+  ansible.builtin.set_fact:
+    lab_ssh_ready: "{{ not ansible_check_mode or (lab_ssh_dirs.results | map(attribute='stat.exists') | min) }}"
+
+- name: Would create the lab key pairs and host configs
+  ansible.builtin.debug:
+    msg:
+      - "{{ lab_ssh_key_dir }}/local.{{ lab_ssh_lab_name }}@{{ item }}{,.pub}"
+      - "{{ lab_ssh_config_dir }}/local.{{ lab_ssh_lab_name }}@{{ item }}"
+  changed_when: true
+  loop: "{{ lab_ssh_roles }}"
+  when: not lab_ssh_ready
+
+- name: Create the lab key pairs
+  when: lab_ssh_ready
+  community.crypto.openssh_keypair:
+    path: "{{ lab_ssh_key_dir }}/local.{{ lab_ssh_lab_name }}@{{ item }}"
+    type: ed25519
+    comment: "local.{{ lab_ssh_lab_name }}@{{ item }}"
+    mode: "0600"
+    regenerate: never
+  loop: "{{ lab_ssh_roles }}"
+
+- name: Write the lab host configs
+  when: lab_ssh_ready
+  ansible.builtin.template:
+    src: ssh_host.j2
+    dest: "{{ lab_ssh_config_dir }}/local.{{ lab_ssh_lab_name }}@{{ item }}"
+    mode: "0600"
+  vars:
+    lab_ssh_role: "{{ item }}"
+  loop: "{{ lab_ssh_roles }}"
+
+- name: Check for ~/.ssh/config
+  ansible.builtin.stat:
+    path: "{{ lab_ssh_dir }}/config"
+  register: lab_ssh_config
+
+- name: Create ~/.ssh/config with the config.d Include
+  ansible.builtin.copy:
+    dest: "{{ lab_ssh_dir }}/config"
+    content: "{{ lab_ssh_include_line }}\n"
+    mode: "0600"
+    force: false
+  when: not lab_ssh_config.stat.exists
+
+- name: Read the existing ~/.ssh/config
+  ansible.builtin.slurp:
+    src: "{{ lab_ssh_dir }}/config"
+  register: lab_ssh_config_content
+  when: lab_ssh_config.stat.exists
+
+- name: Tell the user to add the Include (their ~/.ssh/config is never edited)
+  ansible.builtin.debug:
+    msg:
+      - "{{ lab_ssh_dir }}/config exists but does not include config.d/*."
+      - "Add this line near the TOP of it (before any Host or Match block,"
+      - "or ssh applies it only inside that block):"
+      - ""
+      - "    {{ lab_ssh_include_line }}"
+  when:
+    - lab_ssh_config.stat.exists
+    - lab_ssh_config_content.content | b64decode
+      is not search('(?m)^\s*Include\s+(~/\.ssh/|\$HOME/\.ssh/)?config\.d/\*')
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — Terraform reads the .pub files and ssh the private keys, so
+# both must exist, with the private key unreadable to anyone else.
+# ---------------------------------------------------------------------------
+- name: Stat the lab key pairs and host configs
+  ansible.builtin.stat:
+    path: >-
+      {{ (lab_ssh_config_dir if item.1 == 'config' else lab_ssh_key_dir) ~ '/local.' ~ lab_ssh_lab_name
+         ~ '@' ~ item.0 ~ ('.pub' if item.1 == 'pub' else '') }}
+  loop: "{{ lab_ssh_roles | product(['key', 'pub', 'config']) | list }}"
+  register: lab_ssh_files
+  when: not ansible_check_mode
+
+- name: Assert that every key pair and host config exists (private keys 0600)
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.item.1 != 'key' or item.stat.mode == '0600'
+    fail_msg: "{{ item.stat.path | default(item.item | join(' ')) }} is missing, or a private key that is not mode 0600"
+    quiet: true
+  loop: "{{ lab_ssh_files.results }}"
+  loop_control:
+    label: "{{ item.item | join(' ') }}"
+  when: not ansible_check_mode
+...

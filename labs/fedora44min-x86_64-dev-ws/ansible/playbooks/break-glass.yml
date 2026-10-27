@@ -1,0 +1,79 @@
+---
+# Break-glass: a short-lived Vault token that reads the real credentials
+# (concepts/Operator Interfaces). Run through lab-gateway.mk:
+#
+#   make -f lab-gateway.mk break-glass REASON="why" [CMD="vault kv get ..."]
+#
+# It mints an orphan token with the break-glass policy -- 15 minutes, not
+# renewable, its metadata naming who and why, so the audit log records both --
+# response-wrapped, and leaves only the single-use wrapping token, 0600 on the
+# operator's tmpfs. scripts/gateway/break-glass.sh unwraps it into one shell's
+# environment (or one command's) and revokes it when that exits. A wrapping
+# token someone else read first no longer unwraps, and the script says so.
+- name: Mint a break-glass Vault token
+  hosts: localhost
+  gather_facts: true
+
+  vars:
+    # gateway-host.yml's vault_socket and vault_gateway's break-glass policy
+    # (tests/gateway checks that they agree).
+    vault_socket: /run/vault/vault.sock
+    root_token_file: /etc/ai-sandbox/vault/root.token
+    break_glass_policy: ai-sandbox-break-glass
+    break_glass_ttl: 15m
+    break_glass_wrap_ttl: 120s
+    break_glass_reason: "{{ lookup('ansible.builtin.env', 'BREAK_GLASS_REASON') }}"
+    break_glass_wrap_file: "{{ lookup('ansible.builtin.env', 'BREAK_GLASS_WRAP') }}"
+
+  pre_tasks:
+    - name: Assert lab-gateway.mk passed a reason and the wrapping token's file
+      ansible.builtin.assert:
+        that:
+          - break_glass_reason | length > 0 and break_glass_reason | length <= 200
+          - break_glass_reason is not search('[\x00-\x1f]')
+          - break_glass_wrap_file is match('^/run/user/' ~ ansible_facts['user_uid'] ~ '/[^/ ]+$')
+        fail_msg: 'Run it through: make -f lab-gateway.mk break-glass REASON="why"'
+        quiet: true
+
+  tasks:
+    - name: Read the root token
+      ansible.builtin.slurp:
+        src: "{{ root_token_file }}"
+      register: break_glass_root_b64
+      become: true
+      no_log: true
+
+    - name: Mint the token, response-wrapped
+      ansible.builtin.uri:
+        url: http://localhost/v1/auth/token/create-orphan
+        unix_socket: "{{ vault_socket }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ break_glass_root_b64.content | b64decode | trim }}"
+          X-Vault-Wrap-TTL: "{{ break_glass_wrap_ttl }}"
+        body_format: json
+        body:
+          policies: ["{{ break_glass_policy }}"]
+          ttl: "{{ break_glass_ttl }}"
+          explicit_max_ttl: "{{ break_glass_ttl }}"
+          renewable: false
+          display_name: "break-glass-{{ ansible_facts['user_id'] }}"
+          meta:
+            user: "{{ ansible_facts['user_id'] }}"
+            reason: "{{ break_glass_reason }}"
+      register: break_glass_wrapped
+      no_log: true
+
+    - name: Leave the wrapping token for break-glass.sh (0600, tmpfs)
+      ansible.builtin.copy:
+        content: "{{ break_glass_wrapped.json.wrap_info.token }}"
+        dest: "{{ break_glass_wrap_file }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Show what was minted
+      ansible.builtin.debug:
+        msg: >-
+          A {{ break_glass_ttl }} {{ break_glass_policy }} token for {{ ansible_facts['user_id'] }}
+          ("{{ break_glass_reason }}"), wrapped for {{ break_glass_wrap_ttl }}
+...

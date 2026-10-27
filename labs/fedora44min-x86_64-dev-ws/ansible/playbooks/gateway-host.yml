@@ -1,0 +1,235 @@
+---
+# The zero-trust surrogate-credential gateway on this host (concepts/Zero-Trust
+# Surrogate Gateway). Run through lab-gateway.mk, which always does a dry
+# run (--check --diff) first and applies only after you type "yes":
+#
+#   make -f lab-gateway.mk gateway [TAGS=vault,envoy]
+#
+# Order matters: the binaries, then the PKI (it creates the envoy group Vault
+# Proxy's socket needs), Vault and its configuration, Vault Proxy, Consul and
+# the allow list, then Envoy (it needs all of them), the firewall and the
+# sandbox ssh-agent (it needs Vault's SSH CA).
+#
+# Lab values (gateway_ip, ports, bridges, paths) come from lab-config.mk as
+# one JSON extra-vars document; the gateway's routes and surrogates and the
+# egress catalog from vars/; the pins below are the single source of truth
+# for the gateway's software. The roles have NO defaults.
+- name: Install the zero-trust gateway on the Linux x86_64 host
+  hosts: localhost
+  gather_facts: true
+
+  vars_files:
+    - ../vars/gateway.yml
+    - ../vars/egress-baseline.yml
+
+  vars:
+    vault_version: "2.2.1"
+    consul_version: "2.1.0"
+    consul_template_version: "0.43.1"
+    envoy_version: "1.40.1"
+    # "HashiCorp Security (hashicorp.com/security) <security@hashicorp.com>",
+    # as published at https://www.hashicorp.com/security (expires 2030-03-01).
+    hashicorp_key_fpr: C874011F0AB405110D02105534365D9472D7468F
+    # "Envoy maintainers <envoy-maintainers@googlegroups.com>", as published in
+    # the Envoy repository's releases.asc; it clearsigns every release's
+    # checksums.txt.asc.
+    envoy_key_fpr: 0AFCE836BA4D1D35763C8523D8CDC3750181F31F
+    system_bin: /usr/local/bin
+    # Vault's and Consul's APIs are unix sockets, no TCP (concepts/Vault and
+    # Consul Host Trust). Services open them through these groups (their units'
+    # SupplementaryGroups); the operator through an ACL, so no re-login.
+    vault_socket: /run/vault/vault.sock
+    vault_socket_group: vault-clients
+    consul_socket: /run/consul/consul.sock
+    # Vault's file audit device (vault_gateway), rotated by vault_server.
+    vault_audit_dir: /var/log/vault
+    consul_socket_group: consul-clients
+    gateway_operators: ["{{ ansible_facts['user_id'] }}"]
+    vault_proxy_socket_path: /run/vault-proxy/proxy.sock
+    pki_dir: /etc/ai-sandbox/pki
+    egress_kv_prefix: ai-sandbox/egress
+    # Every catalog category is seeded; drop one here to stop seeding it (its
+    # keys are then pruned).
+    egress_baseline_categories:
+      - rpm-fedora
+      - rpm-redhat
+      - python
+      - go
+      - frontend
+      - rust
+      - java
+      - ansible
+      - terraform
+      - source-hosts
+      - oci-registries
+      - claude
+    # The sandbox ssh-agent's certificate lifetime (scenario 4).
+    agent_cert_ttl: 8h
+
+  pre_tasks:
+    - name: Assert lab-gateway.mk passed the lab values
+      ansible.builtin.assert:
+        that:
+          - gateway_ip is defined
+          - proxy_port is defined
+          - gateway_port is defined
+          - sandbox_bridge is defined
+          - sandbox_cidr is defined
+          - ca_trust_dir is defined
+          - tls_inspection_dir is defined
+          - operator_dir is defined
+          - project_root is defined
+          - sandbox_agent_sock is defined
+        fail_msg: "Run this playbook through: make -f lab-gateway.mk gateway"
+        quiet: true
+      tags: [always]
+
+    # The real credentials (host_vars/localhost: vars.yml names them, vault.yml
+    # holds them encrypted). Rendering gateway_secrets fails on the first
+    # one vault.yml lacks; that name, never a value, is what is reported.
+    - name: Check that vault.yml holds every gateway secret
+      tags: [vault]
+      block:
+        # Templating is lazy: only rendering every value reaches them all.
+        - name: Render every gateway secret (nothing is shown)
+          ansible.builtin.set_fact:
+            gateway_secret_lengths: "{{ gateway_secrets | dict2items | map(attribute='value') | map('length') | list }}"
+          no_log: true
+      rescue:
+        - name: Report the missing secret
+          ansible.builtin.fail:
+            msg: >-
+              {{ ansible_failed_result.msg | regex_search("'[a-z0-9_]+' is undefined")
+                 | default('A gateway secret is missing', true) }}
+              in the host inventory's vault.yml: make -f lab-gateway.mk secrets
+
+  roles:
+    - role: hashicorp_release
+      hashicorp_release_product: vault
+      hashicorp_release_version: "{{ vault_version }}"
+      hashicorp_release_key_fpr: "{{ hashicorp_key_fpr }}"
+      hashicorp_release_dest: "{{ system_bin }}"
+      become: true
+      tags: [binaries, vault]
+
+    - role: hashicorp_release
+      hashicorp_release_product: consul
+      hashicorp_release_version: "{{ consul_version }}"
+      hashicorp_release_key_fpr: "{{ hashicorp_key_fpr }}"
+      hashicorp_release_dest: "{{ system_bin }}"
+      become: true
+      tags: [binaries, consul]
+
+    - role: hashicorp_release
+      hashicorp_release_product: consul-template
+      hashicorp_release_version: "{{ consul_template_version }}"
+      hashicorp_release_key_fpr: "{{ hashicorp_key_fpr }}"
+      hashicorp_release_dest: "{{ system_bin }}"
+      become: true
+      tags: [binaries, consul]
+
+    - role: envoy_release
+      envoy_release_version: "{{ envoy_version }}"
+      envoy_release_key_fpr: "{{ envoy_key_fpr }}"
+      envoy_release_dest: "{{ system_bin }}"
+      become: true
+      tags: [binaries, envoy]
+
+    - role: gateway_pki
+      gateway_pki_dir: "{{ pki_dir }}"
+      gateway_pki_key_group: envoy
+      gateway_pki_gateway_hosts: "{{ gateway_routes | map(attribute='host') | list }}"
+      gateway_pki_trust_export_dir: "{{ ca_trust_dir }}"
+      gateway_pki_upstream_dir: "{{ project_root }}/.pki/upstream"
+      gateway_pki_upstream_hosts: >-
+        {{ gateway_routes | selectattr('upstream.ca', 'eq', 'upstream') | map(attribute='upstream.sni') | list }}
+      tags: [pki]
+
+    - role: vault_server
+      vault_server_bin: "{{ system_bin }}/vault"
+      vault_server_socket: "{{ vault_socket }}"
+      vault_server_socket_group: "{{ vault_socket_group }}"
+      vault_server_operators: "{{ gateway_operators }}"
+      vault_server_data_dir: /var/lib/vault
+      vault_server_config_dir: /etc/vault.d
+      vault_server_secrets_dir: /etc/ai-sandbox/vault
+      vault_server_audit_dir: "{{ vault_audit_dir }}"
+      tags: [vault]
+
+    - role: vault_gateway
+      vault_gateway_socket: "{{ vault_socket }}"
+      vault_gateway_root_token_file: /etc/ai-sandbox/vault/root.token
+      vault_gateway_audit_file: "{{ vault_audit_dir }}/audit.log"
+      vault_gateway_operator_dir: "{{ operator_dir }}"
+      vault_gateway_surrogates: "{{ surrogates }}"
+      vault_gateway_secrets: "{{ gateway_secrets }}"
+      vault_gateway_github_repos: "{{ github_repos }}"
+      vault_gateway_scp_user: "{{ scp_target_user }}"
+      tags: [vault]
+
+    - role: vault_proxy
+      vault_proxy_bin: "{{ system_bin }}/vault"
+      vault_proxy_vault_socket: "{{ vault_socket }}"
+      vault_proxy_vault_group: "{{ vault_socket_group }}"
+      vault_proxy_root_token_file: /etc/ai-sandbox/vault/root.token
+      vault_proxy_config_dir: /etc/vault-proxy.d
+      vault_proxy_socket: "{{ vault_proxy_socket_path }}"
+      vault_proxy_socket_group: envoy
+      vault_proxy_approle: envoy-gateway
+      tags: [vault]
+
+    - role: consul_server
+      consul_server_bin: "{{ system_bin }}/consul"
+      consul_server_socket: "{{ consul_socket }}"
+      consul_server_socket_group: "{{ consul_socket_group }}"
+      consul_server_operators: "{{ gateway_operators }}"
+      consul_server_data_dir: /var/lib/consul
+      consul_server_config_dir: /etc/consul.d
+      consul_server_secrets_dir: /etc/ai-sandbox/consul
+      tags: [consul]
+
+    - role: consul_egress
+      consul_egress_socket: "{{ consul_socket }}"
+      consul_egress_bootstrap_token_file: /etc/ai-sandbox/consul/bootstrap.token
+      consul_egress_kv_prefix: "{{ egress_kv_prefix }}"
+      consul_egress_catalog: "{{ egress_catalog }}"
+      consul_egress_categories: "{{ egress_baseline_categories }}"
+      consul_egress_gateway_hosts: "{{ gateway_routes | map(attribute='host') | list }}"
+      consul_egress_template_token_file: /etc/ai-sandbox/consul-template/consul.token
+      consul_egress_template_token_group: consul-template
+      consul_egress_operator_dir: "{{ operator_dir }}"
+      tags: [consul]
+
+    - role: envoy_gateway
+      envoy_gateway_bin: "{{ system_bin }}/envoy"
+      envoy_gateway_consul_template_bin: "{{ system_bin }}/consul-template"
+      envoy_gateway_listen_ip: "{{ gateway_ip }}"
+      envoy_gateway_sandbox_cidr: "{{ sandbox_cidr }}"
+      envoy_gateway_proxy_port: "{{ proxy_port }}"
+      envoy_gateway_gateway_port: "{{ gateway_port }}"
+      envoy_gateway_routes: "{{ gateway_routes }}"
+      envoy_gateway_pki_dir: "{{ pki_dir }}"
+      envoy_gateway_vault_socket: "{{ vault_proxy_socket_path }}"
+      envoy_gateway_consul_socket: "{{ consul_socket }}"
+      envoy_gateway_consul_group: "{{ consul_socket_group }}"
+      envoy_gateway_consul_token_file: /etc/ai-sandbox/consul-template/consul.token
+      # Optional: the TLS-inspecting proxy's CA chain (lab-config.mk
+      # TLS_INSPECTION_DIR), added to what Envoy verifies public upstreams with.
+      envoy_gateway_tls_inspection_dir: "{{ tls_inspection_dir }}"
+      tags: [envoy]
+
+    - role: sandbox_firewall
+      sandbox_firewall_bridge: "{{ sandbox_bridge }}"
+      sandbox_firewall_gateway_ip: "{{ gateway_ip }}"
+      sandbox_firewall_ports: ["{{ proxy_port }}", "{{ gateway_port }}"]
+      tags: [firewall]
+
+    - role: sandbox_ssh_agent
+      sandbox_ssh_agent_socket: "{{ sandbox_agent_sock }}"
+      sandbox_ssh_agent_vault_socket: "{{ vault_socket }}"
+      sandbox_ssh_agent_operator_dir: "{{ operator_dir }}"
+      sandbox_ssh_agent_principal: "{{ scp_target_user }}"
+      sandbox_ssh_agent_ttl: "{{ agent_cert_ttl }}"
+      sandbox_ssh_agent_ssh_mount: ssh-sandbox
+      tags: [ssh_agent]
+...

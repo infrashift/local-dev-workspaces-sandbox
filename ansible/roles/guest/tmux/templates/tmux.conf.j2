@@ -1,0 +1,17 @@
+# {{ tmux_conf_path }}
+# Managed by the ai-sandbox 'tmux' role. Edits are overwritten on the next run --
+# put personal settings in ~/.tmux.conf, which tmux reads after this file.
+
+# tmux-256color is tmux's own description and is installed with ncurses-base.
+# RGB is advertised for xterm-256color clients so Neovim can use true colour.
+set -g default-terminal "tmux-256color"
+set -as terminal-overrides ",xterm-256color:RGB"
+
+set -g mouse on
+
+# Neovim reads a lone Escape followed by another key as Alt+key unless tmux
+# passes Escape through quickly. 10ms keeps mode switches instant.
+set -g escape-time 10
+
+# Lets Neovim's autoread notice files changed in the other pane.
+set -g focus-events on

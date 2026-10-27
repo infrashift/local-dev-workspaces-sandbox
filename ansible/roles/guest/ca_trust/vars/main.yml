@@ -1,0 +1,42 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries rely on the same ca-certificates/p11-kit layout, asserted below.
+ca_trust_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+ca_trust_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# ROLE CONSTANTS — the Fedora/EL ca-certificates layout. Not caller-settable:
+# defaults/ is reserved for inputs, and every input is asserted in tasks/.
+# ---------------------------------------------------------------------------
+ca_trust_anchor_dir: /etc/pki/ca-trust/source/anchors
+ca_trust_update_bin: /usr/bin/update-ca-trust
+# The extracted PEM bundle (/etc/pki/tls/certs/ca-bundle.crt links here).
+ca_trust_bundle: /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+ca_trust_profile_hook: /etc/profile.d/ca-trust.sh
+ca_trust_environment_d: /etc/environment.d/50-ca-trust.conf
+
+# Tools that carry their own root store instead of reading the system one:
+#   SSL_CERT_FILE        uv (bundled webpki roots), and OpenSSL-based tools generally
+#   REQUESTS_CA_BUNDLE   requests (certifi's bundle)
+#   PIP_CERT             pip
+#   NODE_EXTRA_CA_CERTS  Node.js, bun, Claude Code
+ca_trust_env:
+  SSL_CERT_FILE: "{{ ca_trust_bundle }}"
+  REQUESTS_CA_BUNDLE: "{{ ca_trust_bundle }}"
+  PIP_CERT: "{{ ca_trust_bundle }}"
+  NODE_EXTRA_CA_CERTS: "{{ ca_trust_bundle }}"
+
+# GET the URL with the interpreter's default SSL context. An HTTP error status
+# still proved the TLS handshake; only connection or certificate errors fail.
+ca_trust_python_probe: |
+  import sys, urllib.error, urllib.request
+  try:
+      urllib.request.urlopen(sys.argv[1], timeout=30).close()
+  except urllib.error.HTTPError:
+      pass
+...

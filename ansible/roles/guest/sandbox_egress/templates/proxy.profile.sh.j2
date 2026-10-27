@@ -1,0 +1,7 @@
+# {{ ansible_managed }}
+# Every egress from this sandbox goes through the ai-sandbox gateway: the
+# CONNECT tunnel for allow-listed sites, and (NO_PROXY) the TLS gateway for
+# {{ sandbox_egress_gateway_hosts | join(', ') }}, whose names /etc/hosts maps to it.
+{% for name, value in sandbox_egress_env.items() %}
+export {{ name }}='{{ value }}'
+{% endfor %}

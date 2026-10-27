@@ -1,0 +1,433 @@
+---
+# A single-node Consul on loopback that holds the egress allow list. ACLs are
+# on with default deny: consul-template reads the allow list with a read-only
+# token, the operator edits it with a token scoped to it (consul_egress), and
+# the bootstrap (management) token stays root-only on this host.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - consul_server_bin is defined and consul_server_bin is match('^/[^ ]+$')
+      # The HTTP API is a unix socket in the unit's RuntimeDirectory (/run/<dir>/), never TCP.
+      - consul_server_socket is defined and consul_server_socket is match('^/run/[a-z][a-z0-9-]*/[^/ ]+\.sock$')
+      - consul_server_socket_group is defined and consul_server_socket_group is match('^[a-z][a-z0-9_-]*$')
+      - consul_server_operators is defined and consul_server_operators is sequence
+      - consul_server_operators is not string
+      - consul_server_operators | reject('match', '^[a-z_][a-z0-9_-]*$') | list | length == 0
+      - consul_server_data_dir is defined and consul_server_data_dir is match('^/[^ ]+$')
+      - consul_server_config_dir is defined and consul_server_config_dir is match('^/[^ ]+$')
+      - consul_server_secrets_dir is defined and consul_server_secrets_dir is match('^/[^ ]+$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        consul_server_bin          absolute path to the consul binary (hashicorp_release)
+        consul_server_socket       /run/<dir>/<name>.sock: the HTTP API (systemd's RuntimeDirectory)
+        consul_server_socket_group the group services join (SupplementaryGroups) to open the socket
+        consul_server_operators    the users the socket opens to by ACL (the operator, no re-login)
+        consul_server_data_dir     absolute data directory
+        consul_server_config_dir   absolute configuration directory
+        consul_server_secrets_dir  absolute root-only directory for the bootstrap and agent tokens
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      Consul's API on {{ consul_server_socket }} (group {{ consul_server_socket_group }}, operators
+      {{ consul_server_operators | join(', ') }}), data in {{ consul_server_data_dir }}
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Install Consul
+  become: true
+  block:
+    - name: Install acl (setfacl gives the operators the socket)
+      ansible.builtin.apt:
+        name: acl
+        state: present
+
+    # Consul takes the socket's group as a number.
+    - name: Create the socket group
+      ansible.builtin.group:
+        name: "{{ consul_server_socket_group }}"
+        system: true
+      register: consul_server_group
+
+    - name: Create the consul system user
+      ansible.builtin.user:
+        name: "{{ consul_server_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ consul_server_data_dir }}"
+        create_home: false
+
+    - name: Create the Consul directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ consul_server_config_dir }}", owner: root, group: "{{ consul_server_user }}", mode: "0750" }
+        - path: "{{ consul_server_data_dir }}"
+          owner: "{{ consul_server_user }}"
+          group: "{{ consul_server_user }}"
+          mode: "0700"
+        - { path: "{{ consul_server_secrets_dir }}", owner: root, group: root, mode: "0700" }
+      loop_control:
+        label: "{{ item.path }}"
+
+    # The gossip key: generated once, kept root-only, and handed to Consul in a
+    # file of its own that is never diffed, so a dry run cannot print it.
+    - name: Check for the gossip key
+      ansible.builtin.stat:
+        path: "{{ consul_server_gossip_key_file }}"
+      register: consul_server_gossip_stat
+
+    - name: Would generate the gossip key
+      ansible.builtin.debug:
+        msg: "{{ consul_server_gossip_key_file }}"
+      changed_when: true
+      when: not consul_server_gossip_stat.stat.exists and ansible_check_mode
+
+    - name: Generate the gossip key
+      when: not consul_server_gossip_stat.stat.exists and not ansible_check_mode
+      block:
+        # check-mode: "Would generate the gossip key" reports it; this block runs only for real.
+        - name: Generate a gossip key
+          ansible.builtin.command: "{{ consul_server_bin }} keygen"
+          register: consul_server_keygen
+          changed_when: true
+          no_log: true
+
+        - name: Store the gossip key (root-only)
+          ansible.builtin.copy:
+            content: "{{ consul_server_keygen.stdout | trim }}\n"
+            dest: "{{ consul_server_gossip_key_file }}"
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+    - name: Read the gossip key
+      ansible.builtin.slurp:
+        src: "{{ consul_server_gossip_key_file }}"
+      register: consul_server_gossip_b64
+      no_log: true
+      when: consul_server_gossip_stat.stat.exists or not ansible_check_mode
+
+    - name: Write the gossip key's configuration
+      ansible.builtin.template:
+        src: encrypt.hcl.j2
+        dest: "{{ consul_server_encrypt_config }}"
+        owner: root
+        group: "{{ consul_server_user }}"
+        mode: "0640"
+      diff: false
+      no_log: true
+      notify: consul_server restart
+      when: consul_server_gossip_b64.content is defined
+
+    - name: Write the Consul configuration
+      ansible.builtin.template:
+        src: consul.hcl.j2
+        dest: "{{ consul_server_config }}"
+        owner: root
+        group: "{{ consul_server_user }}"
+        mode: "0640"
+      vars:
+        consul_server_socket_gid: "{{ consul_server_group.gid | default('') }}"
+      notify: consul_server restart
+
+    - name: Install the systemd unit
+      ansible.builtin.template:
+        src: consul.service.j2
+        dest: /etc/systemd/system/consul.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: consul_server restart
+
+- name: Stat the consul binary and its unit
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: ["{{ consul_server_bin }}", /etc/systemd/system/consul.service]
+  register: consul_server_present
+
+- name: Enable and start Consul
+  ansible.builtin.systemd_service:
+    name: consul
+    enabled: true
+    state: started
+    daemon_reload: true
+  become: true
+  when: not ansible_check_mode or (consul_server_present.results | map(attribute='stat.exists') | min)
+
+- name: Apply a pending Consul restart now (later roles need it serving)
+  ansible.builtin.meta: flush_handlers
+
+# In a dry run on a fresh host Consul is not serving yet; the ACL bootstrap
+# then waits for the real run.
+- name: Wait for a Consul leader
+  ansible.builtin.uri:
+    url: "{{ consul_server_url }}/v1/status/leader"
+    unix_socket: "{{ consul_server_socket }}"
+    return_content: true
+  register: consul_server_leader
+  until: consul_server_leader.content | default('') is match('^"\d')
+  retries: "{{ 3 if ansible_check_mode else 60 }}"
+  delay: 1
+  check_mode: false
+  failed_when: consul_server_leader.content | default('') is not match('^"\d') and not ansible_check_mode
+
+- name: Decide whether Consul is serving in this pass
+  ansible.builtin.set_fact:
+    consul_server_live: "{{ consul_server_leader.content | default('') is match('^\"\\d') }}"
+
+- name: Check for the bootstrap token
+  ansible.builtin.stat:
+    path: "{{ consul_server_bootstrap_token_file }}"
+  register: consul_server_bootstrap_stat
+  become: true
+
+- name: Would bootstrap the ACL system and store the management token root-only
+  ansible.builtin.debug:
+    msg: "{{ consul_server_bootstrap_token_file }}"
+  changed_when: true
+  when: not consul_server_bootstrap_stat.stat.exists and (ansible_check_mode or not consul_server_live)
+
+- name: Bootstrap the ACL system
+  when: consul_server_live and not consul_server_bootstrap_stat.stat.exists and not ansible_check_mode
+  become: true
+  block:
+    - name: Bootstrap the ACL system
+      ansible.builtin.uri:
+        url: "{{ consul_server_url }}/v1/acl/bootstrap"
+        unix_socket: "{{ consul_server_socket }}"
+        method: PUT
+        status_code: [200, 403]
+      register: consul_server_bootstrap
+      no_log: true
+
+    - name: Fail when ACLs were bootstrapped but the token is lost
+      ansible.builtin.fail:
+        msg: >-
+          Consul's ACLs are already bootstrapped but {{ consul_server_bootstrap_token_file }} is missing.
+          Reset them (https://developer.hashicorp.com/consul/docs/security/acl/acl-bootstrap#reset-the-acl-system)
+          or wipe {{ consul_server_data_dir }} (the allow list then reseeds; operator entries are lost),
+          then re-run make -f lab-gateway.mk gateway.
+      when: consul_server_bootstrap.status == 403
+
+    - name: Store the management token (root-only)
+      ansible.builtin.copy:
+        content: "{{ consul_server_bootstrap.json.SecretID }}\n"
+        dest: "{{ consul_server_bootstrap_token_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+- name: Give the agent its own token
+  when: consul_server_live and (consul_server_bootstrap_stat.stat.exists or not ansible_check_mode)
+  become: true
+  block:
+    - name: Read the management token
+      ansible.builtin.slurp:
+        src: "{{ consul_server_bootstrap_token_file }}"
+      register: consul_server_mgmt_b64
+      no_log: true
+
+    - name: Read the agent policy
+      ansible.builtin.uri:
+        url: "{{ consul_server_url }}/v1/acl/policy/name/{{ consul_server_agent_policy }}"
+        unix_socket: "{{ consul_server_socket }}"
+        headers: { X-Consul-Token: "{{ consul_server_mgmt_b64.content | b64decode | trim }}" }
+        status_code: [200, 403, 404]
+      register: consul_server_agent_policy_current
+      check_mode: false
+
+    - name: Would create or update the agent policy
+      ansible.builtin.debug:
+        msg: "{{ consul_server_agent_policy }}"
+      changed_when: true
+      when:
+        - ansible_check_mode
+        - consul_server_agent_policy_current.json.Rules | default('') != consul_server_agent_rules
+
+    - name: Create or update the agent policy
+      ansible.builtin.uri:
+        url: >-
+          {{ consul_server_url }}/v1/acl/policy{{ ('/' ~ consul_server_agent_policy_current.json.ID)
+          if consul_server_agent_policy_current.status == 200 else '' }}
+        unix_socket: "{{ consul_server_socket }}"
+        method: PUT
+        headers: { X-Consul-Token: "{{ consul_server_mgmt_b64.content | b64decode | trim }}" }
+        body_format: json
+        body: { Name: "{{ consul_server_agent_policy }}", Rules: "{{ consul_server_agent_rules }}" }
+      changed_when: true
+      when:
+        - not ansible_check_mode
+        - consul_server_agent_policy_current.json.Rules | default('') != consul_server_agent_rules
+
+    - name: Check for the agent token
+      ansible.builtin.stat:
+        path: "{{ consul_server_agent_token_file }}"
+      register: consul_server_agent_token_stat
+
+    - name: Would create the agent token and set it on the agent
+      ansible.builtin.debug:
+        msg: "{{ consul_server_agent_token_file }}"
+      changed_when: true
+      when: ansible_check_mode and not consul_server_agent_token_stat.stat.exists
+
+    - name: Create the agent token and set it on the agent
+      when: not ansible_check_mode and not consul_server_agent_token_stat.stat.exists
+      block:
+        - name: Create the agent token
+          ansible.builtin.uri:
+            url: "{{ consul_server_url }}/v1/acl/token"
+            unix_socket: "{{ consul_server_socket }}"
+            method: PUT
+            headers: { X-Consul-Token: "{{ consul_server_mgmt_b64.content | b64decode | trim }}" }
+            body_format: json
+            body:
+              Description: ai-sandbox Consul agent
+              Policies: [{ Name: "{{ consul_server_agent_policy }}" }]
+          register: consul_server_agent_token
+          changed_when: true
+          no_log: true
+
+        # Persisted by enable_token_persistence.
+        - name: Set the agent token
+          ansible.builtin.uri:
+            url: "{{ consul_server_url }}/v1/agent/token/agent"
+            unix_socket: "{{ consul_server_socket }}"
+            method: PUT
+            headers: { X-Consul-Token: "{{ consul_server_mgmt_b64.content | b64decode | trim }}" }
+            body_format: json
+            body: { Token: "{{ consul_server_agent_token.json.SecretID }}" }
+          changed_when: true
+          no_log: true
+
+        - name: Store the agent token (root-only)
+          ansible.builtin.copy:
+            content: "{{ consul_server_agent_token.json.SecretID }}\n"
+            dest: "{{ consul_server_agent_token_file }}"
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — ACLs deny anonymous K/V writes, and Consul's HTTP API is its
+# unix socket only (0660 for the socket group, rw by ACL for the operators).
+# Skipped only in a dry run on a host without Consul.
+# ---------------------------------------------------------------------------
+# A denied write changes nothing, so the probe is safe in a dry run too.
+- name: Try an anonymous K/V write
+  ansible.builtin.uri:
+    url: "{{ consul_server_url }}/v1/kv/ai-sandbox/acl-probe"
+    unix_socket: "{{ consul_server_socket }}"
+    method: PUT
+    body: probe
+    status_code: [200, 403]
+  register: consul_server_anonymous
+  check_mode: false
+  when: consul_server_live
+
+- name: Stat the Consul socket
+  ansible.builtin.stat:
+    path: "{{ consul_server_socket }}"
+  register: consul_server_socket_stat
+  when: consul_server_live
+
+- name: Read the socket's ACL
+  ansible.builtin.command: getfacl -cp {{ consul_server_socket }}
+  register: consul_server_socket_acl
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when: consul_server_live
+
+# ss -p names other users' processes only for root.
+- name: List the processes listening on TCP
+  ansible.builtin.command: ss -Hltnp
+  register: consul_server_ss
+  changed_when: false
+  check_mode: false
+  become: true
+  when: consul_server_live
+
+# Consul still listens on TCP for its own server RPC and LAN gossip (loopback,
+# gossip encrypted); never for the HTTP API.
+- name: Assert ACLs deny anonymous writes, and the API is the socket only
+  ansible.builtin.assert:
+    that:
+      - consul_server_anonymous.status == 403 or (ansible_check_mode and not consul_server_bootstrap_stat.stat.exists)
+      - consul_server_socket_stat.stat.issock
+      - consul_server_socket_stat.stat.mode == '0660'
+      - consul_server_socket_stat.stat.gr_name == consul_server_socket_group
+      - consul_server_operators | map('regex_replace', '^(.*)$', 'user:\\1:rw-')
+        | difference(consul_server_socket_acl.stdout_lines) | length == 0
+      - consul_server_tcp | map('regex_replace', '^127\\.0\\.0\\.1:', '') | sort == consul_server_tcp_ports | sort
+    fail_msg: >-
+      an anonymous K/V write returned {{ consul_server_anonymous.status }} (expected 403);
+      {{ consul_server_socket }}: {{ consul_server_socket_stat.stat }} {{ consul_server_socket_acl.stdout_lines }};
+      Consul's TCP listeners {{ consul_server_tcp }}, expected 127.0.0.1:{{ consul_server_tcp_ports | join(', :') }}
+    success_msg: >-
+      Consul's API on {{ consul_server_socket }} only ({{ consul_server_socket_group }} and
+      {{ consul_server_operators | join(', ') }}); anonymous K/V writes denied
+  vars:
+    consul_server_tcp: >-
+      {{ consul_server_ss.stdout_lines | select('search', '"consul"') | map('split') | map(attribute=3) | list }}
+  when: consul_server_live
+
+# The units' sandboxing, scored by systemd (0 best, 10 worst); measured when
+# it was set, so a weaker unit fails here (concepts/Vault and Consul Host Trust).
+- name: Score the sandboxing of Consul's unit
+  ansible.builtin.command: systemd-analyze security --no-pager {{ item }}.service
+  loop: [consul]
+  register: consul_server_security
+  changed_when: false
+  check_mode: false
+  when: consul_server_live and not ansible_check_mode
+
+- name: Assert the sandboxing of Consul's unit has not weakened
+  ansible.builtin.assert:
+    that: consul_server_score | float <= consul_server_max_exposure
+    fail_msg: >-
+      {{ item.item }}.service exposure {{ consul_server_score }}, at most {{ consul_server_max_exposure }}:
+      {{ item.stdout_lines | last }}
+    success_msg: "{{ item.item }}.service exposure {{ consul_server_score }} (at most {{ consul_server_max_exposure }})"
+  loop: "{{ consul_server_security.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    consul_server_score: "{{ item.stdout_lines | last | regex_search('[0-9]+[.][0-9]+') }}"
+  when: consul_server_live and not ansible_check_mode
+...

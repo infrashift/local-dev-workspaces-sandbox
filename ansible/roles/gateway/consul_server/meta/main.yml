@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  author: infrashift
+  description: A single-node Consul server on loopback with ACLs (default deny), bootstrapped, on the Linux x86_64 host
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - consul
+    - hashicorp
+    - linux
+
+dependencies: []
+...

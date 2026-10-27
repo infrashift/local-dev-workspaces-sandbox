@@ -1,0 +1,582 @@
+---
+# Vault, configured for the zero-trust gateway (concepts/Surrogate Credential
+# Model):
+#   ai-sandbox/ (kv-v2)  surrogates/<id>: the real credential each surrogate
+#                        stands for, the hosts and the repository it is
+#                        bound to (records of surrogates no longer
+#                        configured are deleted)
+#   ssh-sandbox/ (ssh)   the CA that signs the sandbox ssh-agent's certificate
+#   AppRole envoy-gateway, policy envoy-surrogate-reader: what Vault Proxy
+#                        (and so Envoy) may read
+#   an operator token    (OPERATOR_DIR, 0600): reads the surrogate records,
+#                        signs SSH certificates; never handed to a guest
+# The real credentials come from the host inventory (vars.yml gateway_secrets,
+# encrypted in vault.yml; make -f lab-gateway.mk secrets). Each is checked
+# against its service first: a GitHub PAT must belong to someone and read its
+# private repository, the Anthropic key must list the models. Every task that
+# touches one is no_log.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - vault_gateway_socket is defined and vault_gateway_socket is match('^/[^ ]+\.sock$')
+      - vault_gateway_root_token_file is defined and vault_gateway_root_token_file is match('^/[^ ]+$')
+      - vault_gateway_audit_file is defined and vault_gateway_audit_file is match('^/[^ ]+\.log$')
+      - vault_gateway_operator_dir is defined and vault_gateway_operator_dir is match('^/[^ ]+$')
+      - vault_gateway_surrogates is defined and vault_gateway_surrogates is mapping
+      - vault_gateway_surrogates | length > 0
+      - >-
+        vault_gateway_surrogates.values() | rejectattr('credential', 'defined') | list | length == 0
+      - >-
+        vault_gateway_surrogates.values() | map(attribute='scheme') | reject('in', ['basic', 'bearer', 'x-api-key'])
+        | list | length == 0
+      - >-
+        vault_gateway_surrogates.values() | map(attribute='secret', default='') | reject('match', '^[a-z][a-z0-9_-]*$')
+        | list | length == 0
+      - vault_gateway_secrets is defined and vault_gateway_secrets is mapping
+      - vault_gateway_github_repos is defined and vault_gateway_github_repos is mapping
+      - >-
+        vault_gateway_github_repos.values() | map(attribute='repo', default='')
+        | reject('match', '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') | list | length == 0
+      - vault_gateway_scp_user is defined and vault_gateway_scp_user is match('^[a-z][a-z0-9-]*$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        vault_gateway_socket           vault_server's unix socket
+        vault_gateway_root_token_file  absolute path of the root token vault_server stored
+        vault_gateway_audit_file       the audit log (in vault_server's audit directory)
+        vault_gateway_operator_dir     absolute directory for the operator token (OPERATOR_DIR)
+        vault_gateway_surrogates       vars/gateway.yml surrogates: {name: {credential, scheme
+                                       (basic|bearer|x-api-key), target_hosts, repo, secret}}
+        vault_gateway_secrets          {secret name: the real credential} (host inventory
+                                       gateway_secrets, from vault.yml)
+        vault_gateway_github_repos     vars/gateway.yml github_repos: {secret name: {repo: owner/name}}
+        vault_gateway_scp_user         the SCP target's user, the SSH certificate principal
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      Vault {{ vault_gateway_socket }}: surrogates {{ vault_gateway_surrogates.keys() | join(', ') }};
+      operator token in {{ vault_gateway_operator_token_file }}
+
+# Names only: no value is ever printed.
+- name: Assert that every surrogate's secret is supplied, and every GitHub one is bound to its repository
+  ansible.builtin.assert:
+    that:
+      - vault_gateway_missing_secrets | length == 0
+      - vault_gateway_unsafe_secrets | length == 0
+      - vault_gateway_misbound | length == 0
+    fail_msg: >-
+      Missing secrets {{ vault_gateway_missing_secrets }} (make -f lab-gateway.mk secrets NAME=<name>);
+      secrets with a quote, backslash, space or newline {{ vault_gateway_unsafe_secrets }} (Envoy's Lua
+      filter cannot carry them); surrogates whose secret is a repository's PAT but whose repo:
+      differs, or that use basic auth for a non-GitHub secret {{ vault_gateway_misbound }}.
+    quiet: true
+  vars:
+    vault_gateway_missing_secrets: >-
+      {{ vault_gateway_surrogates.values() | map(attribute='secret') | unique
+         | difference(vault_gateway_secrets.keys()) | list }}
+    vault_gateway_unsafe_secrets: >-
+      {{ vault_gateway_secrets | dict2items | selectattr('value', 'search', '[\s"\x5c]|^$')
+         | map(attribute='key') | list }}
+    vault_gateway_misbound: >-
+      {{ vault_gateway_surrogates | dict2items
+         | selectattr('value.secret', 'in', vault_gateway_github_repos.keys() | list)
+         | rejectattr('value.repo', 'defined') | map(attribute='key') | list
+         + (vault_gateway_surrogates | dict2items
+            | selectattr('value.secret', 'in', vault_gateway_github_repos.keys() | list)
+            | selectattr('value.repo', 'defined')
+            | rejectattr('value.repo', 'in', vault_gateway_github_repos.values() | map(attribute='repo') | list)
+            | map(attribute='key') | list)
+         + (vault_gateway_surrogates | dict2items | selectattr('value.scheme', 'eq', 'basic')
+            | rejectattr('value.secret', 'in', vault_gateway_github_repos.keys() | list)
+            | map(attribute='key') | list) }}
+
+# ---------------------------------------------------------------------------
+# THE CREDENTIALS, checked against their services (read-only calls, so they
+# run in a dry run too). Only the outcome is kept: status codes, the login
+# and whether the repository is private.
+# ---------------------------------------------------------------------------
+- name: Ask GitHub whom each PAT belongs to
+  ansible.builtin.uri:
+    url: https://api.github.com/user
+    headers:
+      Authorization: "Bearer {{ vault_gateway_secrets[item.key] }}"
+      X-GitHub-Api-Version: "2022-11-28"
+    status_code: [200, 401, 403]
+  loop: "{{ vault_gateway_github_repos | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: vault_gateway_github_user
+  check_mode: false
+  no_log: true
+
+- name: Ask GitHub whether each PAT reads its repository
+  ansible.builtin.uri:
+    url: "https://api.github.com/repos/{{ item.value.repo }}"
+    headers:
+      Authorization: "Bearer {{ vault_gateway_secrets[item.key] }}"
+      X-GitHub-Api-Version: "2022-11-28"
+    status_code: [200, 401, 403, 404]
+  loop: "{{ vault_gateway_github_repos | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: vault_gateway_github_repo
+  check_mode: false
+  no_log: true
+
+- name: Start with no GitHub answers kept
+  ansible.builtin.set_fact:
+    vault_gateway_github: {}
+
+- name: Keep what GitHub answered (status codes, the login, the repository's visibility)
+  ansible.builtin.set_fact:
+    vault_gateway_github: >-
+      {{ vault_gateway_github | combine({item.0.item.key: {
+           'repo': item.0.item.value.repo, 'user_status': item.0.status, 'repo_status': item.1.status,
+           'login': (item.0.json.login if item.0.status == 200 else ''),
+           'private': (item.1.json.private if item.1.status == 200 else false)}}) }}
+  loop: "{{ vault_gateway_github_user.results | zip(vault_gateway_github_repo.results) | list }}"
+  loop_control:
+    label: "{{ item.0.item.key }}"
+
+- name: Assert that each PAT belongs to someone and reads its PRIVATE repository
+  ansible.builtin.assert:
+    that:
+      - item.value.user_status == 200
+      - item.value.repo_status == 200
+      - item.value.private
+    fail_msg: >-
+      {{ item.key }}: GitHub answered {{ item.value.user_status }} for the PAT's user and
+      {{ item.value.repo_status }} for {{ item.value.repo }}{{ '' if item.value.private else ' (or it is public)' }}.
+      401: the PAT is wrong or expired. 403 or 404: it is not limited to that repository with
+      Contents and Metadata read, or the organisation has not approved it. A public repository proves
+      nothing about injection. Fix it, then: make -f lab-gateway.mk secrets NAME={{ item.key }}
+    success_msg: "{{ item.key }}: {{ item.value.login }}'s PAT reads the private {{ item.value.repo }}"
+  loop: "{{ vault_gateway_github | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Ask Anthropic whether the API key lists the models
+  ansible.builtin.uri:
+    url: https://api.anthropic.com/v1/models
+    headers:
+      x-api-key: "{{ vault_gateway_secrets['anthropic'] }}"
+      anthropic-version: "2023-06-01"
+    status_code: [200, 401, 403]
+  register: vault_gateway_anthropic
+  check_mode: false
+  no_log: true
+  when: "'anthropic' in vault_gateway_secrets"
+
+- name: Assert that the Anthropic API key is accepted
+  ansible.builtin.assert:
+    that: vault_gateway_anthropic.status == 200
+    fail_msg: >-
+      api.anthropic.com answered {{ vault_gateway_anthropic.status }} for the API key: it is wrong or
+      revoked. Fix it, then: make -f lab-gateway.mk secrets NAME=anthropic
+    success_msg: "the Anthropic API key is accepted"
+  when: "'anthropic' in vault_gateway_secrets"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+# In a dry run on a fresh host Vault is not serving yet (vault_server would
+# install and initialise it); everything below then waits for the real run.
+- name: Check whether Vault is serving and unsealed
+  ansible.builtin.uri:
+    url: "{{ vault_gateway_url }}/v1/sys/health"
+    unix_socket: "{{ vault_gateway_socket }}"
+  register: vault_gateway_health
+  check_mode: false
+  failed_when: vault_gateway_health.status != 200 and not ansible_check_mode
+
+- name: Would configure Vault for the gateway once it is installed
+  ansible.builtin.debug:
+    msg: "mounts, policies, AppRole, SSH CA, operator token"
+  changed_when: true
+  when: vault_gateway_health.status != 200
+
+- name: Configure Vault for the gateway
+  when: vault_gateway_health.status == 200
+  block:
+    - name: Read the root token
+      ansible.builtin.slurp:
+        src: "{{ vault_gateway_root_token_file }}"
+      register: vault_gateway_root_token_b64
+      become: true
+      no_log: true
+
+    - name: Keep the root token for this role's API calls
+      ansible.builtin.set_fact:
+        vault_gateway_root_token: "{{ vault_gateway_root_token_b64.content | b64decode | trim }}"
+      no_log: true
+
+    - name: Read the secrets engines and auth methods
+      ansible.builtin.uri:
+        url: "{{ vault_gateway_url }}/v1/sys/{{ item }}"
+        unix_socket: "{{ vault_gateway_socket }}"
+        headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+      loop: [mounts, auth]
+      register: vault_gateway_enabled
+      check_mode: false
+
+    - name: Would enable a secrets engine or auth method
+      ansible.builtin.debug:
+        msg: "{{ item.path }} ({{ item.body.type }})"
+      changed_when: true
+      loop: "{{ vault_gateway_enable }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: ansible_check_mode and item.mount ~ '/' not in vault_gateway_enabled.results[item.index].json.data
+      vars:
+        vault_gateway_enable: &vault_gateway_enable
+          - { index: 0, mount: "{{ vault_gateway_kv_mount }}", path: "sys/mounts/{{ vault_gateway_kv_mount }}",
+              body: { type: kv, options: { version: "2" } } }
+          - { index: 0, mount: "{{ vault_gateway_ssh_mount }}", path: "sys/mounts/{{ vault_gateway_ssh_mount }}",
+              body: { type: ssh } }
+          - { index: 1, mount: approle, path: sys/auth/approle, body: { type: approle } }
+
+    - name: Enable the secrets engines and AppRole
+      ansible.builtin.uri:
+        url: "{{ vault_gateway_url }}/v1/{{ item.path }}"
+        unix_socket: "{{ vault_gateway_socket }}"
+        method: POST
+        headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+        body_format: json
+        body: "{{ item.body }}"
+        status_code: [200, 204]
+      changed_when: true
+      loop: *vault_gateway_enable
+      loop_control:
+        label: "{{ item.path }}"
+      when: not ansible_check_mode and item.mount ~ '/' not in vault_gateway_enabled.results[item.index].json.data
+
+    # The audit device: every request and response, secrets HMAC'd, in a
+    # vault-only file that vault_server rotates. It fails closed: when the log
+    # cannot be written, Vault refuses requests.
+    - name: Read the audit devices
+      ansible.builtin.uri:
+        url: "{{ vault_gateway_url }}/v1/sys/audit"
+        unix_socket: "{{ vault_gateway_socket }}"
+        headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+      register: vault_gateway_audit
+      check_mode: false
+
+    - name: Would enable the file audit device
+      ansible.builtin.debug:
+        msg: "{{ vault_gateway_audit_file }}"
+      changed_when: true
+      when: ansible_check_mode and vault_gateway_audit_device not in vault_gateway_audit.json.data
+
+    - name: Enable the file audit device
+      ansible.builtin.uri:
+        url: "{{ vault_gateway_url }}/v1/sys/audit/{{ vault_gateway_audit_device | trim('/') }}"
+        unix_socket: "{{ vault_gateway_socket }}"
+        method: PUT
+        headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+        body_format: json
+        body: { type: file, options: { file_path: "{{ vault_gateway_audit_file }}", mode: "0600" } }
+        status_code: [200, 204]
+      changed_when: true
+      when: not ansible_check_mode and vault_gateway_audit_device not in vault_gateway_audit.json.data
+
+    - name: Ensure the policies
+      ansible.builtin.include_tasks: ensure.yml
+      loop: "{{ vault_gateway_policies }}"
+      loop_control:
+        loop_var: vault_gateway_policy
+        label: "{{ vault_gateway_policy.name }}"
+      vars:
+        vault_gateway_object:
+          path: "sys/policies/acl/{{ vault_gateway_policy.name }}"
+          data: { policy: "{{ vault_gateway_policy.policy }}" }
+          kv: false
+          secret: false
+
+    - name: Ensure the envoy-gateway AppRole
+      ansible.builtin.include_tasks: ensure.yml
+      vars:
+        vault_gateway_object:
+          path: "auth/approle/role/{{ vault_gateway_approle }}"
+          data: "{{ vault_gateway_approle_config }}"
+          kv: false
+          secret: false
+
+    - name: Check for the SSH CA
+      ansible.builtin.uri:
+        url: "{{ vault_gateway_url }}/v1/{{ vault_gateway_ssh_mount }}/public_key"
+        unix_socket: "{{ vault_gateway_socket }}"
+        status_code: [200, 400, 404]
+        return_content: true
+      register: vault_gateway_ssh_ca
+      check_mode: false
+
+    - name: Would generate the SSH CA
+      ansible.builtin.debug:
+        msg: "{{ vault_gateway_ssh_mount }}/config/ca"
+      changed_when: true
+      when: ansible_check_mode and vault_gateway_ssh_ca.status != 200
+
+    - name: Generate the SSH CA
+      ansible.builtin.uri:
+        url: "{{ vault_gateway_url }}/v1/{{ vault_gateway_ssh_mount }}/config/ca"
+        unix_socket: "{{ vault_gateway_socket }}"
+        method: POST
+        headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+        body_format: json
+        body: { generate_signing_key: true, key_type: ssh-ed25519 }
+      changed_when: true
+      when: not ansible_check_mode and vault_gateway_ssh_ca.status != 200
+
+    - name: Ensure the SSH role for the SCP target
+      ansible.builtin.include_tasks: ensure.yml
+      vars:
+        vault_gateway_object:
+          path: "{{ vault_gateway_ssh_mount }}/roles/{{ vault_gateway_scp_user }}"
+          data: "{{ vault_gateway_ssh_role_config }}"
+          kv: false
+          secret: false
+
+    # One record per surrogate, in its scheme's form (basic carries the login
+    # GitHub reported for the PAT), and the same binding without the secret in
+    # the record's metadata (record.yml). ensure.yml writes only what differs,
+    # with no_log, so a re-run writes nothing.
+    - name: Ensure the surrogate records and their metadata
+      ansible.builtin.include_tasks: record.yml
+      loop: "{{ vault_gateway_surrogates | dict2items }}"
+      loop_control:
+        loop_var: vault_gateway_surrogate
+        label: "{{ vault_gateway_surrogate.key }}"
+      vars:
+        vault_gateway_s: "{{ vault_gateway_surrogate.value }}"
+        vault_gateway_secret: "{{ vault_gateway_secrets[vault_gateway_s.secret] }}"
+        vault_gateway_header: "{{ 'x-api-key' if vault_gateway_s.scheme == 'x-api-key' else 'authorization' }}"
+        vault_gateway_value: >-
+          {{ ('Basic ' ~ ((vault_gateway_github[vault_gateway_s.secret].login ~ ':' ~ vault_gateway_secret)
+                          | b64encode)) if vault_gateway_s.scheme == 'basic'
+             else ('Bearer ' ~ vault_gateway_secret) if vault_gateway_s.scheme == 'bearer'
+             else vault_gateway_secret }}
+        vault_gateway_record_id: "{{ vault_gateway_surrogate_ids[vault_gateway_surrogate.key] }}"
+
+    # A record whose surrogate is no longer in vars/gateway.yml would still be
+    # honoured by Envoy, so it is deleted, as is anything left under fixtures/
+    # (the lab's former mock MCP account).
+    - name: List the surrogate records and fixtures
+      ansible.builtin.uri:
+        url: "{{ vault_gateway_url }}/v1/{{ vault_gateway_kv_mount }}/metadata/{{ item }}?list=true"
+        unix_socket: "{{ vault_gateway_socket }}"
+        headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+        status_code: [200, 404]
+      loop: [surrogates, fixtures]
+      register: vault_gateway_listed
+      check_mode: false
+
+    - name: Start with no record ids listed
+      ansible.builtin.set_fact:
+        vault_gateway_listed_keys: {}
+
+    # A 404 is an empty folder.
+    - name: Collect the listed record ids
+      ansible.builtin.set_fact:
+        vault_gateway_listed_keys: >-
+          {{ vault_gateway_listed_keys
+             | combine({item.item: (item.json['data']['keys'] if item.status == 200 else [])}) }}
+      loop: "{{ vault_gateway_listed.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Find the records no surrogate names
+      ansible.builtin.set_fact:
+        vault_gateway_stale: >-
+          {{ (vault_gateway_listed_keys['surrogates'] | difference(vault_gateway_surrogate_ids.values())
+              | map('regex_replace', '^', 'surrogates/') | list)
+             + (vault_gateway_listed_keys['fixtures'] | map('regex_replace', '^', 'fixtures/') | list) }}
+
+    - name: Would delete the stale records
+      ansible.builtin.debug:
+        msg: "{{ vault_gateway_kv_mount }}/{{ item }}"
+      changed_when: true
+      loop: "{{ vault_gateway_stale }}"
+      when: ansible_check_mode
+
+    - name: Delete the stale records, with every version
+      ansible.builtin.uri:
+        url: "{{ vault_gateway_url }}/v1/{{ vault_gateway_kv_mount }}/metadata/{{ item }}"
+        unix_socket: "{{ vault_gateway_socket }}"
+        method: DELETE
+        headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+        status_code: [204]
+      changed_when: true
+      loop: "{{ vault_gateway_stale }}"
+      when: not ansible_check_mode
+
+    - name: Create the operator directory
+      ansible.builtin.file:
+        path: "{{ vault_gateway_operator_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Read the operator token
+      ansible.builtin.slurp:
+        src: "{{ vault_gateway_operator_token_file }}"
+      register: vault_gateway_operator_token_b64
+      failed_when: false
+      no_log: true
+
+    - name: Check the operator token is valid and carries the operator policy
+      ansible.builtin.uri:
+        url: "{{ vault_gateway_url }}/v1/auth/token/lookup-self"
+        unix_socket: "{{ vault_gateway_socket }}"
+        headers:
+          X-Vault-Token: "{{ vault_gateway_operator_token_b64.content | default('') | b64decode | trim }}"
+        status_code: [200, 400, 403]
+      register: vault_gateway_operator_lookup
+      check_mode: false
+      no_log: true
+
+    - name: Decide whether to create the operator token
+      ansible.builtin.set_fact:
+        vault_gateway_operator_needed: >-
+          {{ vault_gateway_operator_lookup.status != 200
+             or vault_gateway_operator_policy not in vault_gateway_operator_lookup.json.data.policies }}
+
+    - name: Would create the operator token
+      ansible.builtin.debug:
+        msg: "{{ vault_gateway_operator_token_file }}"
+      changed_when: true
+      when: ansible_check_mode and vault_gateway_operator_needed
+
+    # Periodic: it never expires while the scripts that use it renew it.
+    - name: Create the operator token
+      ansible.builtin.uri:
+        url: "{{ vault_gateway_url }}/v1/auth/token/create-orphan"
+        unix_socket: "{{ vault_gateway_socket }}"
+        method: POST
+        headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+        body_format: json
+        body:
+          policies: ["{{ vault_gateway_operator_policy }}"]
+          period: 768h
+          display_name: ai-sandbox-operator
+      register: vault_gateway_operator_created
+      changed_when: true
+      no_log: true
+      when: not ansible_check_mode and vault_gateway_operator_needed
+
+    - name: Store the operator token (0600)
+      ansible.builtin.copy:
+        content: "{{ vault_gateway_operator_created.json.auth.client_token }}\n"
+        dest: "{{ vault_gateway_operator_token_file }}"
+        mode: "0600"
+      no_log: true
+      when: not ansible_check_mode and vault_gateway_operator_needed
+
+    # The operator's CLI environment (concepts/Operator Interfaces):
+    # `. OPERATOR_DIR/env.sh`, then vault (and consul, consul_egress's
+    # env.d/consul.sh) reach the sockets with the operator tokens.
+    - name: Create the operator's bin and env.d directories
+      ansible.builtin.file:
+        path: "{{ vault_gateway_operator_dir }}/{{ item }}"
+        state: directory
+        mode: "0700"
+      loop: [bin, env.d]
+
+    - name: Write the operator's CLI environment and the vault token helper
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop: "{{ vault_gateway_cli_files }}"
+      loop_control:
+        label: "{{ item.dest }}"
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the reader policy reads surrogates and nothing else, and the
+# operator token works. Skipped only in a dry run that would configure.
+# ---------------------------------------------------------------------------
+- name: Read the reader policy back
+  ansible.builtin.uri:
+    url: "{{ vault_gateway_url }}/v1/sys/policies/acl/{{ vault_gateway_reader_policy }}"
+    unix_socket: "{{ vault_gateway_socket }}"
+    headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+    status_code: [200, 404]
+  register: vault_gateway_reader
+  check_mode: false
+  when: vault_gateway_health.status == 200
+
+- name: Read the operator and break-glass policies and the audit devices back
+  ansible.builtin.uri:
+    url: "{{ vault_gateway_url }}/v1/{{ item }}"
+    unix_socket: "{{ vault_gateway_socket }}"
+    headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+    status_code: [200, 404]
+  loop:
+    - "sys/policies/acl/{{ vault_gateway_operator_policy }}"
+    - "sys/policies/acl/{{ vault_gateway_break_glass_policy }}"
+    - sys/audit
+  register: vault_gateway_readback
+  check_mode: false
+  when: vault_gateway_health.status == 200
+
+- name: Read the SSH CA's public key
+  ansible.builtin.uri:
+    url: "{{ vault_gateway_url }}/v1/{{ vault_gateway_ssh_mount }}/public_key"
+    unix_socket: "{{ vault_gateway_socket }}"
+    status_code: [200, 400, 404]
+    return_content: true
+  register: vault_gateway_ssh_ca_verify
+  check_mode: false
+  when: vault_gateway_health.status == 200
+
+- name: Assert the reader policy is read-only on surrogates, and the SSH CA is up
+  ansible.builtin.assert:
+    that:
+      - vault_gateway_reader.status == 200 and vault_gateway_ssh_ca_verify.status == 200
+      # The operator reads metadata only; the break-glass policy alone reads the real values.
+      - vault_gateway_readback.results[0].json.data.policy is not search('/data/surrogates')
+      - vault_gateway_readback.results[1].json.data.policy is search('/data/surrogates')
+      - >-
+        (vault_gateway_readback.results[2].json.data[vault_gateway_audit_device].options.file_path | default(''))
+        == vault_gateway_audit_file
+      - vault_gateway_reader.json.data.policy is search('capabilities = \["read"\]')
+      - vault_gateway_reader.json.data.policy is not search('create|update|delete|sudo|list')
+      - vault_gateway_ssh_ca_verify.content is match('^ssh-ed25519 ')
+    fail_msg: >-
+      {{ vault_gateway_reader_policy }}: {{ vault_gateway_reader.json.data.policy }};
+      SSH CA: {{ vault_gateway_ssh_ca_verify.content | default('missing') }}
+    success_msg: >-
+      {{ vault_gateway_reader_policy }}: read-only on {{ vault_gateway_kv_mount }}/data/surrogates/*;
+      {{ vault_gateway_operator_policy }}: metadata only; SSH CA up; audit log {{ vault_gateway_audit_file }}
+  # A dry run on a Vault not yet configured has nothing to verify.
+  when: >-
+    vault_gateway_health.status == 200
+    and (not ansible_check_mode or (vault_gateway_reader.status == 200 and vault_gateway_ssh_ca_verify.status == 200
+         and vault_gateway_readback.results[1].status == 200
+         and vault_gateway_audit_device in vault_gateway_readback.results[2].json.data))
+...

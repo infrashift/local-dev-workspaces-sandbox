@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  author: infrashift
+  description: Point a sandbox guest's every egress at the zero-trust gateway (hosts, proxy, dnf, ssh)
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Fedora
+      versions:
+        - "44"
+  galaxy_tags:
+    - proxy
+    - sandbox
+    - fedora
+
+dependencies: []
+...

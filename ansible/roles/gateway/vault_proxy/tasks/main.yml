@@ -1,0 +1,287 @@
+---
+# Vault Proxy: the ONLY way Envoy reaches Vault. It authenticates with the
+# envoy-gateway AppRole (role_id/secret_id root-provisioned, readable by
+# vault-proxy alone) and listens on a unix socket whose group is Envoy's.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - vault_proxy_bin is defined and vault_proxy_bin is match('^/[^ ]+$')
+      - vault_proxy_vault_socket is defined and vault_proxy_vault_socket is match('^/[^ ]+\.sock$')
+      - vault_proxy_vault_group is defined and vault_proxy_vault_group is match('^[a-z][a-z0-9_-]*$')
+      - vault_proxy_root_token_file is defined and vault_proxy_root_token_file is match('^/[^ ]+$')
+      - vault_proxy_config_dir is defined and vault_proxy_config_dir is match('^/[^ ]+$')
+      - vault_proxy_socket is defined and vault_proxy_socket is match('^/run/vault-proxy/[^/ ]+\.sock$')
+      - vault_proxy_socket_group is defined and vault_proxy_socket_group is match('^[a-z][a-z0-9_-]*$')
+      - vault_proxy_approle is defined and vault_proxy_approle is match('^[a-z][a-z0-9-]*$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        vault_proxy_bin              absolute path to the vault binary
+        vault_proxy_vault_socket     vault_server's unix socket
+        vault_proxy_vault_group      the group that opens it (vault_server's socket group)
+        vault_proxy_root_token_file  absolute path of the root token (to read the AppRole credentials)
+        vault_proxy_config_dir       absolute configuration directory
+        vault_proxy_socket           /run/vault-proxy/<name>.sock (systemd's RuntimeDirectory)
+        vault_proxy_socket_group     the only group that may open the socket (envoy)
+        vault_proxy_approle          the AppRole Vault Proxy logs in with (vault_gateway's)
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      Vault Proxy on {{ vault_proxy_socket }} (group {{ vault_proxy_socket_group }}), AppRole {{ vault_proxy_approle }}
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Install Vault Proxy
+  become: true
+  block:
+    - name: Create the socket group
+      ansible.builtin.group:
+        name: "{{ vault_proxy_socket_group }}"
+        system: true
+
+    - name: Create the vault-proxy system user
+      ansible.builtin.user:
+        name: "{{ vault_proxy_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: /nonexistent
+        create_home: false
+
+    - name: Create the configuration directory
+      ansible.builtin.file:
+        path: "{{ vault_proxy_config_dir }}"
+        state: directory
+        owner: root
+        group: "{{ vault_proxy_user }}"
+        mode: "0750"
+
+    - name: Write the Vault Proxy configuration
+      ansible.builtin.template:
+        src: proxy.hcl.j2
+        dest: "{{ vault_proxy_config }}"
+        owner: root
+        group: "{{ vault_proxy_user }}"
+        mode: "0640"
+      notify: vault_proxy restart
+
+    - name: Install the systemd unit
+      ansible.builtin.template:
+        src: vault-proxy.service.j2
+        dest: "{{ vault_proxy_unit }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: vault_proxy restart
+
+# In a dry run on a fresh host Vault is not serving yet; the AppRole
+# credentials and the service then wait for the real run.
+- name: Check whether Vault is serving and unsealed
+  ansible.builtin.uri:
+    url: "{{ vault_proxy_vault_url }}/v1/sys/health"
+    unix_socket: "{{ vault_proxy_vault_socket }}"
+  register: vault_proxy_health
+  check_mode: false
+  failed_when: vault_proxy_health.status != 200 and not ansible_check_mode
+
+- name: Provision the AppRole credentials
+  when: vault_proxy_health.status == 200
+  become: true
+  block:
+    - name: Read the root token
+      ansible.builtin.slurp:
+        src: "{{ vault_proxy_root_token_file }}"
+      register: vault_proxy_root_token_b64
+      no_log: true
+
+    - name: Read the AppRole's role_id
+      ansible.builtin.uri:
+        url: "{{ vault_proxy_vault_url }}/v1/auth/approle/role/{{ vault_proxy_approle }}/role-id"
+        unix_socket: "{{ vault_proxy_vault_socket }}"
+        headers: { X-Vault-Token: "{{ vault_proxy_root_token_b64.content | b64decode | trim }}" }
+        status_code: [200, 404]
+      register: vault_proxy_role_id
+      check_mode: false
+      no_log: true
+
+    - name: Write the role_id
+      ansible.builtin.copy:
+        content: "{{ vault_proxy_role_id.json.data.role_id }}\n"
+        dest: "{{ vault_proxy_role_id_file }}"
+        owner: "{{ vault_proxy_user }}"
+        group: "{{ vault_proxy_user }}"
+        mode: "0600"
+      notify: vault_proxy restart
+      no_log: true
+      when: vault_proxy_role_id.status == 200
+
+    - name: Read the current secret_id
+      ansible.builtin.slurp:
+        src: "{{ vault_proxy_secret_id_file }}"
+      register: vault_proxy_secret_id_b64
+      failed_when: false
+      no_log: true
+
+    - name: Check that the current secret_id is still valid
+      ansible.builtin.uri:
+        url: "{{ vault_proxy_vault_url }}/v1/auth/approle/role/{{ vault_proxy_approle }}/secret-id/lookup"
+        unix_socket: "{{ vault_proxy_vault_socket }}"
+        method: POST
+        headers: { X-Vault-Token: "{{ vault_proxy_root_token_b64.content | b64decode | trim }}" }
+        body_format: json
+        body: { secret_id: "{{ vault_proxy_secret_id_b64.content | default('') | b64decode | trim }}" }
+        status_code: [200, 204, 400, 404]
+      register: vault_proxy_secret_id_lookup
+      check_mode: false
+      no_log: true
+      when: vault_proxy_secret_id_b64.content is defined
+
+    - name: Decide whether to issue a secret_id
+      ansible.builtin.set_fact:
+        vault_proxy_secret_id_needed: >-
+          {{ vault_proxy_secret_id_b64.content is not defined
+             or vault_proxy_secret_id_lookup.status != 200
+             or vault_proxy_secret_id_lookup.json.data is not defined }}
+
+    - name: Would issue a new secret_id
+      ansible.builtin.debug:
+        msg: "{{ vault_proxy_secret_id_file }}"
+      changed_when: true
+      when: ansible_check_mode and vault_proxy_secret_id_needed
+
+    - name: Issue a secret_id
+      ansible.builtin.uri:
+        url: "{{ vault_proxy_vault_url }}/v1/auth/approle/role/{{ vault_proxy_approle }}/secret-id"
+        unix_socket: "{{ vault_proxy_vault_socket }}"
+        method: POST
+        headers: { X-Vault-Token: "{{ vault_proxy_root_token_b64.content | b64decode | trim }}" }
+      register: vault_proxy_secret_id
+      changed_when: true
+      no_log: true
+      when: not ansible_check_mode and vault_proxy_secret_id_needed
+
+    - name: Write the secret_id
+      ansible.builtin.copy:
+        content: "{{ vault_proxy_secret_id.json.data.secret_id }}\n"
+        dest: "{{ vault_proxy_secret_id_file }}"
+        owner: "{{ vault_proxy_user }}"
+        group: "{{ vault_proxy_user }}"
+        mode: "0600"
+      notify: vault_proxy restart
+      no_log: true
+      when: not ansible_check_mode and vault_proxy_secret_id_needed
+
+- name: Stat the Vault Proxy unit
+  ansible.builtin.stat:
+    path: "{{ vault_proxy_unit }}"
+  register: vault_proxy_unit_stat
+
+- name: Enable and start Vault Proxy
+  ansible.builtin.systemd_service:
+    name: vault-proxy
+    enabled: true
+    state: started
+    daemon_reload: true
+  become: true
+  when: vault_proxy_health.status == 200 and (vault_proxy_unit_stat.stat.exists or not ansible_check_mode)
+
+- name: Apply a pending Vault Proxy restart now (Envoy needs it serving)
+  ansible.builtin.meta: flush_handlers
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the socket is vault-proxy:<group> 0660, and a request through
+# it carries the AppRole token with only the reader policy.
+# ---------------------------------------------------------------------------
+- name: Wait for the Vault Proxy socket
+  ansible.builtin.wait_for:
+    path: "{{ vault_proxy_socket }}"
+    timeout: 30
+  when: vault_proxy_health.status == 200 and not ansible_check_mode
+
+- name: Stat the Vault Proxy socket
+  ansible.builtin.stat:
+    path: "{{ vault_proxy_socket }}"
+  register: vault_proxy_socket_stat
+  become: true
+  when: vault_proxy_health.status == 200
+
+# check-mode: read-only, so it runs in a dry run too.
+- name: Look up the token a request through the socket carries
+  ansible.builtin.command:
+    argv: [curl, -sf, --unix-socket, "{{ vault_proxy_socket }}", "http://vault-proxy/v1/auth/token/lookup-self"]
+  register: vault_proxy_lookup
+  changed_when: false
+  check_mode: false
+  become: true
+  until: vault_proxy_lookup.rc == 0
+  retries: 15
+  delay: 1
+  when: vault_proxy_health.status == 200 and vault_proxy_socket_stat.stat.exists
+
+- name: Assert the socket is guarded and carries only the reader policy
+  ansible.builtin.assert:
+    that:
+      - vault_proxy_socket_stat.stat.issock
+      - vault_proxy_socket_stat.stat.mode == '0660'
+      - vault_proxy_socket_stat.stat.gr_name == vault_proxy_socket_group
+      - (vault_proxy_lookup.stdout | from_json).data.policies | difference(['default']) | length == 1
+    fail_msg: >-
+      {{ vault_proxy_socket }}: mode {{ vault_proxy_socket_stat.stat.mode }} group
+      {{ vault_proxy_socket_stat.stat.gr_name }}; token policies
+      {{ (vault_proxy_lookup.stdout | from_json).data.policies }}
+    success_msg: >-
+      {{ vault_proxy_socket }} ({{ vault_proxy_socket_stat.stat.pw_name }}:{{ vault_proxy_socket_stat.stat.gr_name }}
+      {{ vault_proxy_socket_stat.stat.mode }}): policies {{ (vault_proxy_lookup.stdout | from_json).data.policies }}
+  when: vault_proxy_health.status == 200 and vault_proxy_socket_stat.stat.exists
+
+# The units' sandboxing, scored by systemd (0 best, 10 worst); measured when
+# it was set, so a weaker unit fails here (concepts/Vault and Consul Host Trust).
+- name: Score the sandboxing of Vault Proxy's unit
+  ansible.builtin.command: systemd-analyze security --no-pager {{ item }}.service
+  loop: [vault-proxy]
+  register: vault_proxy_security
+  changed_when: false
+  check_mode: false
+  when: vault_proxy_health.status == 200 and not ansible_check_mode
+
+- name: Assert the sandboxing of Vault Proxy's unit has not weakened
+  ansible.builtin.assert:
+    that: vault_proxy_score | float <= vault_proxy_max_exposure
+    fail_msg: >-
+      {{ item.item }}.service exposure {{ vault_proxy_score }}, at most {{ vault_proxy_max_exposure }}:
+      {{ item.stdout_lines | last }}
+    success_msg: "{{ item.item }}.service exposure {{ vault_proxy_score }} (at most {{ vault_proxy_max_exposure }})"
+  loop: "{{ vault_proxy_security.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    vault_proxy_score: "{{ item.stdout_lines | last | regex_search('[0-9]+[.][0-9]+') }}"
+  when: vault_proxy_health.status == 200 and not ansible_check_mode
+...

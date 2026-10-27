@@ -1,0 +1,204 @@
+---
+# Download a Fedora Cloud image, verified end to end, only if it is absent:
+#   1. the CHECKSUM's GPG signature must come from the PINNED key fingerprint;
+#   2. the image must match the SHA-256 in the *signed* text.
+# Nothing lands in the images directory unless every check passes. The image
+# is moved in last and made read-only: it is a backing file, and every
+# overlay built on it breaks if it ever changes.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - fedora_cloud_image_release is defined and fedora_cloud_image_release is match('^\d+$')
+      - fedora_cloud_image_respin is defined and fedora_cloud_image_respin is match('^\d+\.\d+$')
+      - fedora_cloud_image_arch is defined and fedora_cloud_image_arch in ['x86_64']
+      # The CHECKSUM must be signed by exactly this key, not merely by some
+      # key in fedora.gpg.
+      - fedora_cloud_image_key_fpr is defined and fedora_cloud_image_key_fpr is match('^[0-9A-Fa-f]{40}$')
+      - fedora_cloud_image_dir is defined and fedora_cloud_image_dir is match('^/[^ ]+$')
+      - fedora_cloud_image_qemu_img is defined and fedora_cloud_image_qemu_img is match('^/[^ ]+$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        fedora_cloud_image_release   Fedora release, digits only (e.g. "44"; quote it)
+        fedora_cloud_image_respin    respin X.Y (e.g. "1.7"), the -<respin> in the image name
+        fedora_cloud_image_arch      x86_64 (the only architecture these labs boot)
+        fedora_cloud_image_key_fpr   the release key's 40-hex-digit fingerprint, pinned from
+                                     https://fedoraproject.org/security/
+        fedora_cloud_image_dir       absolute images directory
+        fedora_cloud_image_qemu_img  absolute path to qemu-img
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "{{ fedora_cloud_image_file }} (CHECKSUM signed by {{ fedora_cloud_image_key_fpr }})"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: "Check for {{ fedora_cloud_image_file }}"
+  ansible.builtin.stat:
+    path: "{{ fedora_cloud_image_dir }}/{{ fedora_cloud_image_file }}"
+    get_checksum: false
+  register: fedora_cloud_image_present
+
+- name: "Would download and GPG/SHA-256 verify {{ fedora_cloud_image_file }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ fedora_cloud_image_base_url }}/{{ fedora_cloud_image_file }} -> {{ fedora_cloud_image_dir }}
+      (CHECKSUM signed by {{ fedora_cloud_image_key_fpr }})
+  changed_when: true
+  when: not fedora_cloud_image_present.stat.exists and ansible_check_mode
+
+- name: "Download and verify {{ fedora_cloud_image_file }}"
+  when: not fedora_cloud_image_present.stat.exists and not ansible_check_mode
+  block:
+    - name: Create a scratch directory beside the images (same filesystem, atomic move)
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ fedora_cloud_image_dir }}"
+        prefix: .fetch.
+      register: fedora_cloud_image_tmp
+
+    - name: Download the CHECKSUM file and the Fedora keyring
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "{{ fedora_cloud_image_tmp.path }}/{{ item.name }}"
+        mode: "0644"
+      loop:
+        - url: "{{ fedora_cloud_image_base_url }}/{{ fedora_cloud_image_checksum_file }}"
+          name: "{{ fedora_cloud_image_checksum_file }}"
+        - { url: "{{ fedora_cloud_image_key_url }}", name: fedora.gpg }
+      loop_control:
+        label: "{{ item.name }}"
+
+    # --status-fd reports which key actually signed; --output keeps only the
+    # signed text, so nothing appended outside the signature can add a hash.
+    - name: Verify the CHECKSUM signature
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/gpgv
+          - --status-fd=1
+          - --keyring={{ fedora_cloud_image_tmp.path }}/fedora.gpg
+          - --output={{ fedora_cloud_image_tmp.path }}/CHECKSUM.signed
+          - "{{ fedora_cloud_image_tmp.path }}/{{ fedora_cloud_image_checksum_file }}"
+      register: fedora_cloud_image_gpgv
+      changed_when: false
+
+    - name: Assert the signature is from the pinned key
+      ansible.builtin.assert:
+        that: ('[GNUPG:] VALIDSIG ' ~ (fedora_cloud_image_key_fpr | upper) ~ ' ') in fedora_cloud_image_gpgv.stdout
+        fail_msg: >-
+          {{ fedora_cloud_image_checksum_file }} is not signed by the pinned key {{ fedora_cloud_image_key_fpr }}
+        success_msg: "Good signature from {{ fedora_cloud_image_key_fpr }}"
+
+    - name: Read the signed CHECKSUM text
+      ansible.builtin.slurp:
+        src: "{{ fedora_cloud_image_tmp.path }}/CHECKSUM.signed"
+      register: fedora_cloud_image_signed
+
+    - name: Extract the image's SHA-256 from the signed text
+      ansible.builtin.set_fact:
+        fedora_cloud_image_sha256: >-
+          {{ fedora_cloud_image_signed.content | b64decode
+             | regex_search('SHA256 \(' ~ (fedora_cloud_image_file | regex_escape) ~ '\) = ([0-9a-f]{64})', '\1')
+             | default([''], true) | first }}
+
+    - name: Assert the signed CHECKSUM lists the image
+      ansible.builtin.assert:
+        that: fedora_cloud_image_sha256 | length == 64
+        fail_msg: >-
+          No SHA256 entry for {{ fedora_cloud_image_file }} in the signed {{ fedora_cloud_image_checksum_file }}
+        quiet: true
+
+    - name: "Download the image, verified against the signed SHA-256: {{ fedora_cloud_image_file }}"
+      ansible.builtin.get_url:
+        url: "{{ fedora_cloud_image_base_url }}/{{ fedora_cloud_image_file }}"
+        dest: "{{ fedora_cloud_image_tmp.path }}/{{ fedora_cloud_image_file }}"
+        checksum: "sha256:{{ fedora_cloud_image_sha256 }}"
+        mode: "0444"
+        timeout: 60
+
+    - name: Check the image is qcow2
+      ansible.builtin.command:
+        argv:
+          - "{{ fedora_cloud_image_qemu_img }}"
+          - info
+          - --output=json
+          - "{{ fedora_cloud_image_tmp.path }}/{{ fedora_cloud_image_file }}"
+      register: fedora_cloud_image_info
+      changed_when: false
+      failed_when: (fedora_cloud_image_info.stdout | from_json).format != 'qcow2'
+
+    - name: Keep the CHECKSUM and keyring beside the image
+      ansible.builtin.copy:
+        src: "{{ fedora_cloud_image_tmp.path }}/{{ item }}"
+        dest: "{{ fedora_cloud_image_dir }}/{{ item }}"
+        remote_src: true
+        mode: "0644"
+      loop:
+        - "{{ fedora_cloud_image_checksum_file }}"
+        - fedora.gpg
+
+    - name: Move the verified image into place (last, atomically)
+      ansible.builtin.command:
+        argv:
+          - mv
+          - "{{ fedora_cloud_image_tmp.path }}/{{ fedora_cloud_image_file }}"
+          - "{{ fedora_cloud_image_dir }}/{{ fedora_cloud_image_file }}"
+        creates: "{{ fedora_cloud_image_dir }}/{{ fedora_cloud_image_file }}"
+
+  always:
+    - name: Remove the scratch directory
+      ansible.builtin.file:
+        path: "{{ fedora_cloud_image_tmp.path }}"
+        state: absent
+      when: fedora_cloud_image_tmp.path is defined
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the image is in place and read-only. Skipped only in a dry
+# run that would download it.
+# ---------------------------------------------------------------------------
+- name: "Stat {{ fedora_cloud_image_file }}"
+  ansible.builtin.stat:
+    path: "{{ fedora_cloud_image_dir }}/{{ fedora_cloud_image_file }}"
+    get_checksum: false
+  register: fedora_cloud_image_verify
+  when: fedora_cloud_image_present.stat.exists or not ansible_check_mode
+
+- name: Assert the base image is present and read-only
+  ansible.builtin.assert:
+    that:
+      - fedora_cloud_image_verify.stat.exists
+      - not fedora_cloud_image_verify.stat.wusr
+    fail_msg: >-
+      {{ fedora_cloud_image_dir }}/{{ fedora_cloud_image_file }} is missing or writable; every overlay
+      depends on it never changing (chmod 0444 it, or delete it and re-run to re-verify)
+    success_msg: >-
+      {{ fedora_cloud_image_dir }}/{{ fedora_cloud_image_file }} (mode {{ fedora_cloud_image_verify.stat.mode }})
+  when: fedora_cloud_image_present.stat.exists or not ansible_check_mode
+...

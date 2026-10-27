@@ -1,0 +1,229 @@
+---
+# The self-hosted remote GitHub MCP server: github/github-mcp-server in http
+# mode on loopback, with stunnel in front for TLS (the certificate the lab's
+# upstream-test CA signed, which Envoy verifies it with). The gateway's
+# mcp.upstream route reaches it. It holds no token of its own: it uses the
+# Bearer token on each request, which the gateway injected in place of the
+# sandbox's github_mcp surrogate, and calls GitHub with it over the NAT
+# network (concepts/GitHub MCP Servers Behind the Gateway). System lane.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - upstream_github_mcp_variant in upstream_github_mcp_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      upstream_github_mcp supports {{ upstream_github_mcp_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ upstream_github_mcp_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: upstream_github_mcp_whoami
+  changed_when: false
+  check_mode: false
+
+- name: Assert that the role runs in the system lane
+  ansible.builtin.assert:
+    that: upstream_github_mcp_whoami.stdout == 'root'
+    fail_msg: >-
+      upstream_github_mcp writes system state and must run as root: apply it from a play with
+      become: true (it ran as {{ upstream_github_mcp_whoami.stdout }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - upstream_github_mcp_version is defined and upstream_github_mcp_version is match('^\d+\.\d+\.\d+$')
+      - upstream_github_mcp_checksum is defined and upstream_github_mcp_checksum is match('^[0-9a-f]{64}$')
+      - upstream_github_mcp_port is defined and upstream_github_mcp_port | int > 0
+      - upstream_github_mcp_port | int != upstream_github_mcp_backend_port
+      - upstream_github_mcp_cert_src is defined and upstream_github_mcp_cert_src is match('^/[^ ]+$')
+      - upstream_github_mcp_key_src is defined and upstream_github_mcp_key_src is match('^/[^ ]+$')
+      - upstream_github_mcp_read_only is defined and upstream_github_mcp_read_only is boolean
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        upstream_github_mcp_version    X.Y.Z (a github/github-mcp-server release, vars/github-mcp.yml)
+        upstream_github_mcp_checksum   the 64-hex SHA-256 of that release's {{ upstream_github_mcp_archive }}
+        upstream_github_mcp_port       the HTTPS port (vars/gateway.yml's upstream port; not
+                                       {{ upstream_github_mcp_backend_port }}, the server's loopback port)
+        upstream_github_mcp_cert_src   the server certificate on the controller (gateway_pki's mcp.pem)
+        upstream_github_mcp_key_src    its key on the controller (gateway_pki's mcp.key)
+        upstream_github_mcp_read_only  true: expose the read-only tools only
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      github-mcp-server {{ upstream_github_mcp_version }} on 127.0.0.1:{{ upstream_github_mcp_backend_port }},
+      TLS on :{{ upstream_github_mcp_port }}{{ ', read-only' if upstream_github_mcp_read_only else '' }}
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS — everything written here is root-owned. The server runs as a
+# dynamic user; stunnel reads its files under /etc/stunnel as root, then
+# drops to an unprivileged account.
+# ---------------------------------------------------------------------------
+- name: Install {{ upstream_github_mcp_packages | join(', ') }}
+  ansible.builtin.dnf:
+    name: "{{ upstream_github_mcp_packages }}"
+    state: present
+
+- name: Check the installed github-mcp-server version
+  ansible.builtin.command: "{{ upstream_github_mcp_bin }} --version"
+  register: upstream_github_mcp_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Decide whether to install github-mcp-server {{ upstream_github_mcp_version }}
+  ansible.builtin.set_fact:
+    upstream_github_mcp_install_required: >-
+      {{ upstream_github_mcp_installed.rc != 0
+         or upstream_github_mcp_installed.stdout is not search(upstream_github_mcp_version_line) }}
+
+- name: Would download, SHA-256 verify and install github-mcp-server {{ upstream_github_mcp_version }}
+  ansible.builtin.debug:
+    msg: "{{ upstream_github_mcp_download_url }} -> {{ upstream_github_mcp_bin }}"
+  changed_when: true
+  when: upstream_github_mcp_install_required and ansible_check_mode
+
+- name: Install github-mcp-server {{ upstream_github_mcp_version }}
+  when: upstream_github_mcp_install_required and not ansible_check_mode
+  block:
+    - name: Remove any previously installed github-mcp-server
+      ansible.builtin.file:
+        path: "{{ upstream_github_mcp_install_root }}"
+        state: absent
+
+    - name: Create the github-mcp-server install directory
+      ansible.builtin.file:
+        path: "{{ upstream_github_mcp_install_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download the release tarball (verified against the pinned SHA-256)
+      ansible.builtin.get_url:
+        url: "{{ upstream_github_mcp_download_url }}"
+        dest: "{{ upstream_github_mcp_install_dir }}/{{ upstream_github_mcp_archive }}"
+        checksum: "sha256:{{ upstream_github_mcp_checksum }}"
+        owner: root
+        group: root
+        mode: "0644"
+        timeout: 120
+
+    - name: Unpack the binary
+      ansible.builtin.unarchive:
+        src: "{{ upstream_github_mcp_install_dir }}/{{ upstream_github_mcp_archive }}"
+        dest: "{{ upstream_github_mcp_install_dir }}"
+        remote_src: true
+        include: [github-mcp-server]
+        owner: root
+        group: root
+      notify: upstream_github_mcp restart
+
+    - name: Remove the tarball
+      ansible.builtin.file:
+        path: "{{ upstream_github_mcp_install_dir }}/{{ upstream_github_mcp_archive }}"
+        state: absent
+
+- name: Create the configuration directory
+  ansible.builtin.file:
+    path: "{{ upstream_github_mcp_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Install the certificate and key
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop:
+    - { src: "{{ upstream_github_mcp_cert_src }}", dest: "{{ upstream_github_mcp_cert }}" }
+    - { src: "{{ upstream_github_mcp_key_src }}", dest: "{{ upstream_github_mcp_key }}" }
+  loop_control:
+    label: "{{ item.dest }}"
+  notify: upstream_github_mcp restart
+
+- name: Write stunnel's configuration
+  ansible.builtin.template:
+    src: stunnel.conf.j2
+    dest: "{{ upstream_github_mcp_stunnel_conf }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: upstream_github_mcp restart
+
+- name: Install the systemd units
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ upstream_github_mcp_units }}"
+  loop_control:
+    label: "{{ item.dest }}"
+  notify: upstream_github_mcp restart
+
+- name: Enable and start the GitHub MCP server and its TLS front end
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop: [ai-sandbox-github-mcp, ai-sandbox-github-mcp-tls]
+  when: not ansible_check_mode
+
+- name: Apply a pending restart now
+  ansible.builtin.meta: flush_handlers
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — through stunnel, a request without a token is refused with
+# the server's own Bearer challenge: TLS, the tunnel to loopback and the
+# server all answer. (A request WITH a token is the sandbox suite's job: only
+# the gateway holds one.)
+# ---------------------------------------------------------------------------
+- name: Initialise an MCP session without a token, through TLS
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ upstream_github_mcp_port }}/"
+    method: POST
+    body_format: json
+    body: { jsonrpc: "2.0", id: 1, method: initialize, params: {} }
+    headers: { Accept: "application/json, text/event-stream" }
+    validate_certs: false
+    status_code: [401]
+  register: upstream_github_mcp_refused
+  until: upstream_github_mcp_refused.status == 401
+  retries: 10
+  delay: 1
+  when: not ansible_check_mode
+
+- name: Assert the server demands a GitHub token
+  ansible.builtin.assert:
+    that: upstream_github_mcp_refused.www_authenticate | default('') is match('(?i)^Bearer ')
+    fail_msg: >-
+      https://127.0.0.1:{{ upstream_github_mcp_port }}/ answered {{ upstream_github_mcp_refused.status }}
+      without a Bearer challenge: journalctl -u ai-sandbox-github-mcp -u ai-sandbox-github-mcp-tls
+    success_msg: "github-mcp-server {{ upstream_github_mcp_version }} answers through TLS and demands a token"
+  when: not ansible_check_mode
+...

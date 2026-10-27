@@ -1,0 +1,26 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none.
+# ---------------------------------------------------------------------------
+vault_server_user: vault
+# systemd-analyze security's score for vault.service when its sandboxing was set.
+vault_server_max_exposure: 1.0
+vault_server_config: "{{ vault_server_config_dir }}/vault.hcl"
+# Every API call goes to the unix socket; the URL's host is a placeholder.
+vault_server_url: http://localhost
+vault_server_storage_dir: "{{ vault_server_data_dir }}/file"
+# The raft storage a Vault before the unix-socket change kept in the data
+# directory, and where its migration leaves it.
+vault_server_raft_db: "{{ vault_server_data_dir }}/vault.db"
+vault_server_raft_backup: "{{ vault_server_data_dir }}/raft.migrated"
+vault_server_migrate_config: "{{ vault_server_config_dir }}/migrate.hcl"
+# Root-only: the unseal key and the root token from `vault operator init`.
+vault_server_unseal_key_file: "{{ vault_server_secrets_dir }}/unseal.key"
+vault_server_root_token_file: "{{ vault_server_secrets_dir }}/root.token"
+vault_server_unseal_script: /usr/local/libexec/ai-sandbox/vault-unseal
+vault_server_socket_script: /usr/local/libexec/ai-sandbox/vault-socket
+vault_server_units:
+  - { src: vault.service.j2, dest: /etc/systemd/system/vault.service }
+  - { src: ai-sandbox-vault-unseal.service.j2, dest: /etc/systemd/system/ai-sandbox-vault-unseal.service }
+...

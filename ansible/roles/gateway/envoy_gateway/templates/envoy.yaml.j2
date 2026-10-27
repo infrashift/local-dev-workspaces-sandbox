@@ -1,0 +1,273 @@
+# {{ ansible_managed }}
+# The zero-trust gateway (concepts/Zero-Trust Surrogate Gateway). Envoy binds
+# only the sandbox network's host address; the host firewall lets the guest
+# reach nothing else.
+#   {{ envoy_gateway_listen_ip }}:{{ envoy_gateway_proxy_port }}  CONNECT tunnel, nothing else. Its route table is
+#       the Consul K/V allow list, rendered by consul-template into a file
+#       Envoy watches (RDS): an edit applies without a restart.
+#   {{ envoy_gateway_listen_ip }}:{{ envoy_gateway_gateway_port }}  TLS gateway for the hosts in vars/gateway.yml:
+#       terminates TLS with the gateway CA's certificate, swaps surrogate
+#       credentials (surrogate.lua, through Vault Proxy's unix socket) and
+#       re-originates TLS, verifying the upstream's name.
+# Only the sandbox network's own addresses reach either listener
+# ({{ envoy_gateway_sandbox_cidr }}): a connection from anywhere else matches no filter
+# chain and is closed, even if the host firewall's table is gone.
+# The admin interface, which can raise the log level until the router logs the
+# injected credentials, is a unix socket only the envoy user can open; the
+# operator and the gateway suite get a GET-only view of it (admin_readonly).
+# gateway certificate sha256: {{ envoy_gateway_cert_sha256 }}
+node:
+  id: ai-sandbox-gateway
+  cluster: ai-sandbox
+
+admin:
+  address:
+    # 384 = 0600 (decimal: the mode is a plain integer field).
+    pipe: { path: {{ envoy_gateway_admin_socket }}, mode: 384 }
+
+static_resources:
+  listeners:
+    - name: connect_tunnel
+      address:
+        socket_address: { address: {{ envoy_gateway_listen_ip }}, port_value: {{ envoy_gateway_proxy_port }} }
+      # The bridge may not exist yet when Envoy starts (libvirt brings it up).
+      freebind: true
+      filter_chains:
+        - filter_chain_match:
+            source_prefix_ranges:
+              - { address_prefix: {{ envoy_gateway_sandbox_cidr.split('/')[0] }}, prefix_len: {{ envoy_gateway_sandbox_cidr.split('/')[1] }} }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: connect_tunnel
+                # ncat (the sandbox's ssh ProxyCommand) sends CONNECT as HTTP/1.0;
+                # without this Envoy answers 426 Upgrade Required.
+                http_protocol_options:
+                  accept_http_10: true
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "tunnel %DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT% %REQ(:METHOD)% %REQ(:AUTHORITY)% %RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_SENT%/%BYTES_RECEIVED% %DURATION%ms\n"
+                rds:
+                  route_config_name: connect_routes
+                  config_source:
+                    resource_api_version: V3
+                    path_config_source:
+                      path: {{ envoy_gateway_rds_file }}
+                      watched_directory:
+                        path: {{ envoy_gateway_rds_dir }}
+                upgrade_configs:
+                  - upgrade_type: CONNECT
+                http_filters:
+                  - name: envoy.filters.http.dynamic_forward_proxy
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+                      dns_cache_config:
+                        name: connect_dns_cache
+                        dns_lookup_family: {{ envoy_gateway_dns_lookup_family }}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: true
+
+    - name: tls_gateway
+      address:
+        socket_address: { address: {{ envoy_gateway_listen_ip }}, port_value: {{ envoy_gateway_gateway_port }} }
+      freebind: true
+      filter_chains:
+        - filter_chain_match:
+            source_prefix_ranges:
+              - { address_prefix: {{ envoy_gateway_sandbox_cidr.split('/')[0] }}, prefix_len: {{ envoy_gateway_sandbox_cidr.split('/')[1] }} }
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                alpn_protocols: [h2, http/1.1]
+                tls_certificates:
+                  - certificate_chain: { filename: {{ envoy_gateway_cert }} }
+                    private_key: { filename: {{ envoy_gateway_key }} }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: tls_gateway
+                codec_type: AUTO
+                # The surrogate filter checks the repository in the path; the
+                # path it reads must be the one the upstream serves. RFC 3986
+                # normalization resolves dot segments, and merge_slashes folds
+                # "//", before any filter runs. Escaped slashes (%2F) pass as
+                # they are: GitHub's API takes them in branch names, and the
+                # owner/repository segments cannot hold one.
+                normalize_path: true
+                merge_slashes: true
+                # Streams (git, SSE, MCP) stay open as long as they need.
+                stream_idle_timeout: 3600s
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "gateway %DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT% %REQ(:METHOD)% %REQ(:AUTHORITY)%%REQ(:PATH):128% %RESPONSE_CODE% %RESPONSE_FLAGS% %DURATION%ms\n"
+                route_config:
+                  name: gateway_routes
+                  virtual_hosts:
+{% for route in envoy_gateway_routes %}
+                    - name: {{ route.host }}
+                      domains: ["{{ route.host }}", "{{ route.host }}:{{ envoy_gateway_gateway_port }}"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: gateway_{{ loop.index }}
+                            timeout: 0s
+{% if route.upstream.host_rewrite is defined %}
+                            host_rewrite_literal: {{ route.upstream.host_rewrite }}
+{% endif %}
+                          metadata:
+                            filter_metadata:
+                              envoy.filters.http.lua:
+                                gateway: true
+                                anonymous: {{ route.anonymous | bool | lower }}
+{% if route.repo_path is defined %}
+                                repo_path: {{ route.repo_path | to_json }}
+{% endif %}
+                      # A bucket per gateway host: what a compromised guest can
+                      # do with the real credentials is bounded by rate too.
+                      typed_per_filter_config:
+                        envoy.filters.http.local_ratelimit:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                          stat_prefix: gateway_rate_limit
+                          token_bucket:
+                            max_tokens: {{ envoy_gateway_rate_limit.burst }}
+                            tokens_per_fill: {{ envoy_gateway_rate_limit.per_second }}
+                            fill_interval: 1s
+                          filter_enabled:
+                            default_value: { numerator: 100, denominator: HUNDRED }
+                          filter_enforced:
+                            default_value: { numerator: 100, denominator: HUNDRED }
+{% endfor %}
+                    - name: not_a_gateway_host
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 404
+                            body: { inline_string: "ai-sandbox gateway: not a gateway host\n" }
+                http_filters:
+                  # Before the surrogate filter, so a flood never reaches Vault.
+                  # Unconfigured here: each gateway host sets its own bucket.
+                  - name: envoy.filters.http.local_ratelimit
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                      stat_prefix: gateway_rate_limit
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code: { filename: {{ envoy_gateway_lua }} }
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: true
+
+    # A GET-only view of the admin interface for the operator: what is loaded
+    # and how it is doing. Every admin endpoint that changes Envoy needs POST,
+    # so none of them is reachable here.
+    - name: admin_readonly
+      address:
+        # 438 = 0666: anyone on the host may read stats and the loaded config
+        # (Envoy redacts private keys from it).
+        pipe: { path: {{ envoy_gateway_admin_readonly_socket }}, mode: 438 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: admin_readonly
+                route_config:
+                  name: admin_readonly
+                  virtual_hosts:
+                    - name: admin_readonly
+                      domains: ["*"]
+                      routes:
+{% for path in envoy_gateway_admin_readonly_paths %}
+                        - match:
+                            path: {{ path }}
+                            headers: [{ name: ":method", string_match: { exact: GET } }]
+                          route: { cluster: envoy_admin }
+{% endfor %}
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 403
+                            body: { inline_string: "ai-sandbox gateway: the read-only admin view serves GET {{ envoy_gateway_admin_readonly_paths | join(' ') }}\n" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: true
+
+  clusters:
+    - name: envoy_admin
+      connect_timeout: 1s
+      type: STATIC
+      load_assignment:
+        cluster_name: envoy_admin
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe: { path: {{ envoy_gateway_admin_socket }} }
+
+    # Vault Proxy's unix socket: the only path from Envoy to Vault.
+    - name: vault_proxy
+      connect_timeout: 1s
+      type: STATIC
+      load_assignment:
+        cluster_name: vault_proxy
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe: { path: {{ envoy_gateway_vault_socket }} }
+
+    - name: connect_dynamic_forward_proxy
+      connect_timeout: 5s
+      lb_policy: CLUSTER_PROVIDED
+      cluster_type:
+        name: envoy.clusters.dynamic_forward_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+          # The same cache as the filter's (matched by name).
+          dns_cache_config:
+            name: connect_dns_cache
+            dns_lookup_family: {{ envoy_gateway_dns_lookup_family }}
+
+{% for route in envoy_gateway_routes %}
+    # {{ route.host }} -> {{ route.upstream.address }}:{{ route.upstream.port }}, verified as {{ route.upstream.sni }}
+    - name: gateway_{{ loop.index }}
+      connect_timeout: 5s
+      type: {{ 'STATIC' if route.upstream.address is match('^(\d{1,3}\.){3}\d{1,3}$') else 'LOGICAL_DNS' }}
+      dns_lookup_family: {{ envoy_gateway_dns_lookup_family }}
+      load_assignment:
+        cluster_name: gateway_{{ loop.index }}
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{ route.upstream.address }}, port_value: {{ route.upstream.port }} }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: {{ route.upstream.sni }}
+          common_tls_context:
+            validation_context:
+              trusted_ca: { filename: {{ envoy_gateway_ca_files[route.upstream.ca] }} }
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher: { exact: {{ route.upstream.sni }} }
+{% endfor %}

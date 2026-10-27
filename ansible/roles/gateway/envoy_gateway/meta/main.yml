@@ -1,0 +1,21 @@
+---
+galaxy_info:
+  author: infrashift
+  description: >-
+    Envoy as the zero-trust gateway (CONNECT allow list from Consul K/V, TLS surrogate swap) on the
+    Linux x86_64 host
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - envoy
+    - consul
+    - vault
+    - linux
+
+dependencies: []
+...

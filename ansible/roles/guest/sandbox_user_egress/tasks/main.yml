@@ -1,0 +1,121 @@
+---
+# Proxy settings for the toolchains that do not read HTTPS_PROXY (sandbox_egress
+# sets it for everything else): Maven, Gradle, any JVM, npm and cargo. Each
+# file gets a marked block (Maven: a settings.xml written once), so the dev
+# user's own settings in the same files survive.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - sandbox_user_egress_variant in sandbox_user_egress_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      sandbox_user_egress supports {{ sandbox_user_egress_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ sandbox_user_egress_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Assert that the play names the account it provisions
+  ansible.builtin.assert:
+    that: guest_user is defined and guest_user is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: "Set guest_user (the account this user-lane role configures) at the play level."
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: sandbox_user_egress_whoami
+  changed_when: false
+  check_mode: false
+
+- name: Assert that the role runs in the user lane, as guest_user
+  ansible.builtin.assert:
+    that:
+      - sandbox_user_egress_whoami.stdout == guest_user
+      - ansible_facts['user_id'] == guest_user
+    fail_msg: >-
+      sandbox_user_egress writes {{ guest_user }}'s home and must run as that account, without become
+      (it ran as {{ sandbox_user_egress_whoami.stdout }}; facts as {{ ansible_facts['user_id'] }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - sandbox_user_egress_gateway_ip is defined and sandbox_user_egress_gateway_ip is match('^(\d{1,3}\.){3}\d{1,3}$')
+      - sandbox_user_egress_proxy_port is defined and sandbox_user_egress_proxy_port | int > 0
+      - sandbox_user_egress_gateway_hosts is defined and sandbox_user_egress_gateway_hosts is sequence
+      - sandbox_user_egress_gateway_hosts is not string
+      - sandbox_user_egress_gateway_hosts | reject('match', '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$') | list | length == 0
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        sandbox_user_egress_gateway_ip     the gateway's address on the sandbox network (GATEWAY_IP)
+        sandbox_user_egress_proxy_port     the CONNECT tunnel's port (PROXY_PORT)
+        sandbox_user_egress_gateway_hosts  the TLS gateway's host names (reached without the proxy)
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "{{ sandbox_user_egress_proxy_url }} for Maven, Gradle, the JVM, npm and cargo"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Create the toolchains' configuration directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop: "{{ (sandbox_user_egress_blocks | map(attribute='path') | map('dirname') | list
+            + [sandbox_user_egress_m2_settings | dirname]) | unique }}"
+
+- name: Write the proxy blocks
+  ansible.builtin.blockinfile:
+    path: "{{ item.path }}"
+    marker: "{{ item.marker }}"
+    block: "{{ item.block }}"
+    create: true
+    mode: "0600"
+  loop: "{{ sandbox_user_egress_blocks }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Write Maven's settings.xml (once)
+  ansible.builtin.template:
+    src: settings.xml.j2
+    dest: "{{ sandbox_user_egress_m2_settings }}"
+    mode: "0600"
+    force: false
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — every file names the tunnel. Skipped in a dry run that would
+# create them.
+# ---------------------------------------------------------------------------
+- name: Read the proxy configuration back
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop: "{{ sandbox_user_egress_blocks | map(attribute='path') | list + [sandbox_user_egress_m2_settings] }}"
+  register: sandbox_user_egress_files
+  when: not ansible_check_mode
+
+- name: Assert every toolchain's configuration names the gateway's tunnel
+  ansible.builtin.assert:
+    that: (item.content | b64decode) is search(sandbox_user_egress_gateway_ip | regex_escape)
+    fail_msg: "{{ item.item }} does not name {{ sandbox_user_egress_gateway_ip }}"
+    quiet: true
+  loop: "{{ sandbox_user_egress_files.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+...

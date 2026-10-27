@@ -1,0 +1,35 @@
+# {{ ansible_managed }}
+# Vault Proxy for Envoy's Lua filter: it authenticates to Vault with the
+# envoy-gateway AppRole and serves the API on a unix socket that only the
+# {{ vault_proxy_socket_group }} group can open. Every request through it uses
+# the AppRole token (use_auto_auth_token = "force"), so the socket's
+# permissions ARE the access control: no network path to it exists, and the
+# sandbox guest cannot address a host filesystem socket at all.
+pid_file = "/run/vault-proxy/vault-proxy.pid"
+
+vault {
+  # Vault itself listens on a unix socket only.
+  address = "unix://{{ vault_proxy_vault_socket }}"
+}
+
+auto_auth {
+  method "approle" {
+    config = {
+      role_id_file_path                   = "{{ vault_proxy_role_id_file }}"
+      secret_id_file_path                 = "{{ vault_proxy_secret_id_file }}"
+      remove_secret_id_file_after_reading = false
+    }
+  }
+}
+
+api_proxy {
+  use_auto_auth_token = "force"
+}
+
+listener "unix" {
+  address      = "{{ vault_proxy_socket }}"
+  tls_disable  = true
+  socket_mode  = "0660"
+  socket_user  = "{{ vault_proxy_user }}"
+  socket_group = "{{ vault_proxy_socket_group }}"
+}

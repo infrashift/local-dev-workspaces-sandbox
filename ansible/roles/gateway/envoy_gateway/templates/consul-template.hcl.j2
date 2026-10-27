@@ -1,0 +1,30 @@
+# {{ ansible_managed }}
+# Renders Envoy's CONNECT route table from the egress allow list in Consul K/V.
+consul {
+  # Consul's HTTP API is a unix socket only.
+  address = "unix://{{ envoy_gateway_consul_socket }}"
+  token_file = "{{ envoy_gateway_consul_token_file }}"
+  retry {
+    enabled  = true
+    attempts = 0
+    backoff  = "250ms"
+    max_backoff = "30s"
+  }
+}
+
+log_level = "info"
+
+template {
+  source          = "{{ envoy_gateway_ctmpl }}"
+  # Written to a temp file and renamed: Envoy's watched_directory sees a
+  # complete file or none.
+  destination     = "{{ envoy_gateway_rds_file }}"
+  # Envoy reads it through the directory's setgid group.
+  perms           = 0640
+  left_delimiter  = "[["
+  right_delimiter = "]]"
+  wait {
+    min = "1s"
+    max = "5s"
+  }
+}

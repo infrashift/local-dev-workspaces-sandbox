@@ -1,0 +1,24 @@
+# {{ ansible_managed }}
+# TLS for the GitHub MCP server: :{{ upstream_github_mcp_port }} -> 127.0.0.1:{{ upstream_github_mcp_backend_port }}, with the
+# certificate the lab's upstream-test CA signed (Envoy verifies it with that CA).
+# Not DynamicUser/LoadCredential: SELinux's stunnel_t may not read systemd
+# credentials. stunnel reads its files under /etc/stunnel as root and drops to
+# {{ upstream_github_mcp_stunnel_user }} itself (setuid/setgid in its configuration).
+[Unit]
+Description=ai-sandbox GitHub MCP server TLS (stunnel) on :{{ upstream_github_mcp_port }}
+After=network-online.target ai-sandbox-github-mcp.service
+Wants=network-online.target
+Requires=ai-sandbox-github-mcp.service
+
+[Service]
+ExecStart=/usr/bin/stunnel {{ upstream_github_mcp_stunnel_conf }}
+# Only what dropping to {{ upstream_github_mcp_stunnel_user }} needs.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+Restart=on-failure
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,3 @@
+# {{ ansible_managed }}
+# Serf gossip encryption (consul_server). Never diffed or logged.
+encrypt = "{{ consul_server_gossip_b64.content | b64decode | trim }}"

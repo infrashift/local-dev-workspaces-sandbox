@@ -1,0 +1,30 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries are asserted against their prerequisites rather than assumed.
+syft_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+syft_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS — not caller-settable.
+#
+# anchore publishes assets under amd64 / arm64. The architecture is never
+# guessed: a wrong one would install a binary that then passes its own
+# checksum from the upstream checksums file.
+# ---------------------------------------------------------------------------
+syft_home: "{{ ansible_facts['user_dir'] }}"
+syft_bin_dir: "{{ syft_home }}/.local/bin"
+syft_arch: "{{ {'aarch64': 'arm64', 'x86_64': 'amd64'}[ansible_facts['architecture']] }}"
+syft_tarball: "syft_{{ syft_version }}_linux_{{ syft_arch }}.tar.gz"
+syft_checksums_file: "syft_{{ syft_version }}_checksums.txt"
+syft_release_url: "https://github.com/anchore/syft/releases/download/v{{ syft_version }}"
+syft_download_url: "{{ syft_release_url }}/{{ syft_tarball }}"
+syft_checksums_download_url: "{{ syft_release_url }}/{{ syft_checksums_file }}"
+syft_install_root: "{{ syft_home }}/.local/share/syft"
+syft_install_dir: "{{ syft_install_root }}/{{ syft_version }}"
+syft_version_pattern: "(?m)^Version:\\s+{{ syft_version | regex_escape }}$"
+...

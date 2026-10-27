@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- {{ ansible_managed }}
+     Written once (never overwritten): Maven ignores HTTPS_PROXY, so the
+     ai-sandbox gateway's CONNECT tunnel is declared here. -->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.2.0 https://maven.apache.org/xsd/settings-1.2.0.xsd">
+  <proxies>
+{% for protocol in ['https', 'http'] %}
+    <proxy>
+      <id>ai-sandbox-{{ protocol }}</id>
+      <active>true</active>
+      <protocol>{{ protocol }}</protocol>
+      <host>{{ sandbox_user_egress_gateway_ip }}</host>
+      <port>{{ sandbox_user_egress_proxy_port }}</port>
+      <nonProxyHosts>{{ sandbox_user_egress_non_proxy }}</nonProxyHosts>
+    </proxy>
+{% endfor %}
+  </proxies>
+</settings>

@@ -1,0 +1,24 @@
+# concepts
+
+<!-- okfw:generated — maintained by okfw; edits here are overwritten -->
+
+## Concepts
+
+* [Base Images and Machine Overlays](base-images-and-machine-overlays--01a1664337cc.md) - The two stores under ~/VMs: read-only downloaded base images, and per-VM directories with copy-on-write overlays.
+* [Corporate TLS Interception (ZScaler)](corporate-tls-interception-zscaler--01a166e751d7.md) - Why every lab VM and Envoy must trust a TLS-inspecting proxy's (ZScaler's) CA chain when there is one, where TLS_INSPECTION_DIR's chain is installed, what the system trust store covers, and what still is not covered.
+* [Egress Allow List in Consul KV](egress-allow-list-in-consul-kv--01a17f01fd5d.md) - The CONNECT tunnel's allow list: baseline/ (Ansible, from the catalog) and allow/ (the operator) in Consul K/V, rendered by consul-template into Envoy's file-based RDS route table with rules that never let a bad key widen it.
+* [Egress Baseline Catalog](egress-baseline-catalog--01a17f01fd6d.md) - egress-baseline.yml: the categories of sites the sandbox may tunnel to without an operator entry, and the rules each entry must satisfy (HTTPS only, vendor-only wildcards, no gateway host or subdomain, a reason and a probe).
+* [Gateway Credentials in the Host Inventory](gateway-credentials-in-the-host-inventory--01a17e133adc.md) - Why the gateway's real credentials (one fine-grained PAT per GitHub repository, the Anthropic key) live ansible-vault encrypted in the host inventory, how each is bound to its repository and checked before use, and the trade-off.
+* [Gateway Separated from the Host Bootstrap](gateway-separated-from-the-host-bootstrap--01a17000956a.md) - Why the zero-trust gateway is its own stage (lab-gateway.mk, lab-gateway-verify.mk, ansible/roles/gateway/) after the host bootstrap, and the boundary a later move to its own project would cut along.
+* [GitHub MCP Servers Behind the Gateway](github-mcp-servers-behind-the-gateway--01a17de05379.md) - Why the sandbox uses github-mcp-server three ways (local stdio, self-hosted on upstream-1 behind stunnel, GitHub-hosted), each with a bearer surrogate the gateway swaps for the real PAT, and what that implies.
+* [Isolated Sandbox Network](isolated-sandbox-network--01a17e9c824e.md) - The three layers that leave the sandbox VMs only Envoy's two listeners: the isolated libvirt network, the host's own nft table (including the weak-host rule), and Envoy's source-range filter chains.
+* [Lab SSH Identities](lab-ssh-identities--01a1664337d1.md) - Per-lab admin and dev SSH key pairs and host configs, and the ProxyCommand that resolves a VM's DHCP address at connect time.
+* [Operator Interfaces](operator-interfaces--01a17ebdba31.md) - Changes go through make -f lab-gateway.mk and its wrappers; the vault and consul CLIs are for read-only inspection through OPERATOR_DIR/env.sh (unix sockets, operator tokens, no vault login); break-glass is a short-lived, audited token.
+* [QEMU HVF on Apple Silicon](qemu-hvf-on-apple-silicon--01a1664337c1.md) - Why tf-labs drives qemu-system-aarch64 with Hypervisor.framework directly instead of libvirt, and the machine/firmware choices that follow.
+* [Role Contract](role-contract--01a166e751ce.md) - Every Ansible role in this project has no defaults, opens with fail-fast contract and parameter asserts, and ends by asserting the requested state; what that means, and where it departs from the trusted-devcontainer roles it came from.
+* [SSH Agent Forwarding](ssh-agent-forwarding--01a17f01fd23.md) - How scenario 4 authenticates scp from the sandbox without a key in the guest: a dedicated host ssh-agent with a Vault-signed 8-hour certificate, forwarded into the dev session only; destination constraints were tried and are blocked by the host's OpenSSH 9.6.
+* [Surrogate Credential Model](surrogate-credential-model--01a17ecc92e2.md) - What the guest holds (surrogates), what Vault keeps (a record per surrogate, plus its secret-free metadata), how Envoy's Lua filter swaps one for the other with host and repository binding, and who may read what.
+* [Vault and Consul Host Trust](vault-and-consul-host-trust--01a17ebdba27.md) - The gateway's threat model on the host (the guest and its neighbours untrusted, root trusted) and why Vault, Consul, Vault Proxy and Envoy talk over permission-guarded unix sockets instead of TLS or mTLS, with when to revisit.
+* [Zero-Trust Surrogate Gateway](zero-trust-surrogate-gateway--01a17f01fd4c.md) - Overview of the host gateway that gives the sandbox VM what it needs without a real credential: the isolated network, Envoy's tunnel and TLS gateway, Vault/Vault Proxy/Consul, the agent, the operator's tools, and the name-constrained gateway CA.
+* [socket_vmnet Networking](socket-vmnet-networking--01a1664337c7.md) - How lab VMs get host-reachable addresses through Apple vmnet via the socket_vmnet launchd daemon, and how their IPs are discovered.
+

@@ -1,0 +1,15 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none.
+# ---------------------------------------------------------------------------
+sandbox_ssh_agent_home: "{{ ansible_facts['env']['HOME'] }}"
+sandbox_ssh_agent_key: "{{ sandbox_ssh_agent_home }}/.ssh/key.d/ai-sandbox.egress"
+sandbox_ssh_agent_cert: "{{ sandbox_ssh_agent_key }}-cert.pub"
+sandbox_ssh_agent_unit_dir: "{{ sandbox_ssh_agent_home }}/.config/systemd/user"
+sandbox_ssh_agent_unit: ai-sandbox-ssh-agent.service
+sandbox_ssh_agent_helper: "{{ sandbox_ssh_agent_operator_dir }}/bin/ai-sandbox-agent-cert"
+sandbox_ssh_agent_token_file: "{{ sandbox_ssh_agent_operator_dir }}/vault-operator.token"
+# Re-sign when less than this many seconds of validity remain.
+sandbox_ssh_agent_min_seconds: 3600
+...

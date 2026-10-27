@@ -1,0 +1,22 @@
+# {{ ansible_managed }}
+#   ssh local.{{ lab_ssh_lab_name }}.{{ lab_ssh_role }}          the default VM ({{ lab_ssh_default_vm }})
+#   ssh local.{{ lab_ssh_lab_name }}.{{ lab_ssh_role }}.<vm>     a specific VM
+{% if lab_ssh_role == 'dev' %}
+# The dev session on the sandbox VM carries the dedicated sandbox ssh-agent
+# (a Vault-signed, short-lived certificate only): the guest can ask it to sign
+# while this session is open, and can never read the key.
+Host local.{{ lab_ssh_lab_name }}.dev local.{{ lab_ssh_lab_name }}.dev.{{ lab_ssh_default_vm }}
+  ForwardAgent yes
+  IdentityAgent {{ lab_ssh_agent_socket }}
+{% endif %}
+Host local.{{ lab_ssh_lab_name }}.{{ lab_ssh_role }} local.{{ lab_ssh_lab_name }}.{{ lab_ssh_role }}.*
+  User {{ lab_ssh_role }}
+  IdentityFile {{ lab_ssh_key_dir }}/local.{{ lab_ssh_lab_name }}@{{ lab_ssh_role }}
+  IdentitiesOnly yes
+  ForwardAgent no
+  # Lab VMs are disposable; their host keys change on every rebuild.
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+  # Resolve the VM's address from its libvirt DHCP lease when connecting.
+  ProxyCommand "{{ lab_ssh_vm_proxy }}" "{{ lab_ssh_default_vm }}" %n %p

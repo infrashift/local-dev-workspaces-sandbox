@@ -1,0 +1,8 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none.
+# ---------------------------------------------------------------------------
+# The user running the bootstrap; it drives libvirt and KVM without sudo.
+linux_host_packages_operator: "{{ ansible_facts['user_id'] }}"
+...

@@ -1,0 +1,87 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none. The mount and policy names are
+# the contract with Envoy's Lua filter, Vault Proxy and the operator scripts.
+# ---------------------------------------------------------------------------
+# Every API call goes to Vault's unix socket; the URL's host is a placeholder.
+vault_gateway_url: http://localhost
+vault_gateway_kv_mount: ai-sandbox
+vault_gateway_ssh_mount: ssh-sandbox
+vault_gateway_approle: envoy-gateway
+vault_gateway_reader_policy: envoy-surrogate-reader
+vault_gateway_operator_policy: ai-sandbox-operator
+# Reads the real credentials. No standing token carries it: break-glass.yml
+# mints a 15-minute one on demand (concepts/Operator Interfaces).
+vault_gateway_break_glass_policy: ai-sandbox-break-glass
+vault_gateway_audit_device: file/
+vault_gateway_operator_token_file: "{{ vault_gateway_operator_dir }}/vault-operator.token"
+# The operator's CLI environment (env.sh sources every env.d/*.sh).
+vault_gateway_cli_config: "{{ vault_gateway_operator_dir }}/vault-cli.hcl"
+vault_gateway_token_helper: "{{ vault_gateway_operator_dir }}/bin/vault-token-helper"
+vault_gateway_cli_files:
+  - { src: env.sh.j2, dest: "{{ vault_gateway_operator_dir }}/env.sh", mode: "0644" }
+  - { src: vault.env.sh.j2, dest: "{{ vault_gateway_operator_dir }}/env.d/vault.sh", mode: "0644" }
+  - { src: vault-cli.hcl.j2, dest: "{{ vault_gateway_cli_config }}", mode: "0644" }
+  - { src: vault-token-helper.j2, dest: "{{ vault_gateway_token_helper }}", mode: "0755" }
+# Each surrogate's Vault key: base64url of the credential, without padding
+# (Envoy's Lua filter derives the same id from the request header).
+vault_gateway_surrogate_ids: >-
+  {{ dict(vault_gateway_surrogates | dict2items | map(attribute='key')
+     | zip(vault_gateway_surrogates | dict2items | map(attribute='value.credential')
+           | map('b64encode') | map('replace', '+', '-') | map('replace', '/', '_')
+           | map('regex_replace', '=+$', ''))) }}
+vault_gateway_policies:
+  - name: "{{ vault_gateway_reader_policy }}"
+    policy: |
+      # Envoy (through Vault Proxy) reads surrogate records, nothing else.
+      path "{{ vault_gateway_kv_mount }}/data/surrogates/*" {
+        capabilities = ["read"]
+      }
+  - name: "{{ vault_gateway_operator_policy }}"
+    policy: |
+      # The operator sees which surrogates exist and what each is bound to
+      # (the records' metadata: hosts, repository, scheme, a fingerprint) and
+      # signs the sandbox ssh-agent's certificate. It never reads a real
+      # credential: that takes the break-glass policy. Never handed to a guest.
+      path "{{ vault_gateway_kv_mount }}/metadata/surrogates/*" {
+        capabilities = ["read"]
+      }
+      path "{{ vault_gateway_kv_mount }}/metadata/surrogates" {
+        capabilities = ["list"]
+      }
+      path "{{ vault_gateway_ssh_mount }}/sign/{{ vault_gateway_scp_user }}" {
+        capabilities = ["update"]
+      }
+  - name: "{{ vault_gateway_break_glass_policy }}"
+    policy: |
+      # Break-glass: read the real credentials behind the surrogates. Carried
+      # only by the short-lived, non-renewable, audited token break-glass.yml
+      # mints, whose metadata records who and why.
+      path "{{ vault_gateway_kv_mount }}/data/surrogates/*" {
+        capabilities = ["read"]
+      }
+      path "{{ vault_gateway_kv_mount }}/metadata/surrogates/*" {
+        capabilities = ["read"]
+      }
+      path "{{ vault_gateway_kv_mount }}/metadata/surrogates" {
+        capabilities = ["list"]
+      }
+# Field values exactly as Vault returns them (TTLs in seconds), so a re-run
+# compares equal and writes nothing.
+vault_gateway_approle_config:
+  token_policies: ["{{ vault_gateway_reader_policy }}"]
+  token_ttl: 3600
+  token_max_ttl: 14400
+  secret_id_ttl: 0
+  bind_secret_id: true
+vault_gateway_ssh_role_config:
+  key_type: ca
+  allow_user_certificates: true
+  allowed_users: "{{ vault_gateway_scp_user }}"
+  default_user: "{{ vault_gateway_scp_user }}"
+  allowed_extensions: permit-pty
+  default_extensions: { permit-pty: "" }
+  ttl: 28800
+  max_ttl: 86400
+...

@@ -1,0 +1,17 @@
+# {{ ansible_managed }}
+# Unseal the lab Vault after every start with the key `vault operator init`
+# produced (root-only on this host). A lab trade-off: the threat model is the
+# sandbox guest, not root on the host (concepts/Vault and Consul Host Trust).
+[Unit]
+Description=Unseal the ai-sandbox Vault
+After=vault.service
+Requires=vault.service
+PartOf=vault.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={{ vault_server_unseal_script }} {{ vault_server_socket }} {{ vault_server_unseal_key_file }}
+
+[Install]
+WantedBy=vault.service

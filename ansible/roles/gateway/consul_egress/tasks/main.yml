@@ -1,0 +1,345 @@
+---
+# The egress allow list in Consul K/V (concepts/Egress Allow List in Consul KV):
+#   <prefix>/baseline/<category>/<host>:<port>   seeded here from the catalog
+#                                                (vars/egress-baseline.yml);
+#                                                stale keys are pruned
+#   <prefix>/allow/<host>:<port>                 the operator's; never touched here
+# and the ACL tokens around it: consul-template reads the whole prefix; the
+# operator token writes allow/ only.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - consul_egress_socket is defined and consul_egress_socket is match('^/[^ ]+\.sock$')
+      - consul_egress_bootstrap_token_file is defined and consul_egress_bootstrap_token_file is match('^/[^ ]+$')
+      - consul_egress_kv_prefix is defined and consul_egress_kv_prefix is match('^[a-z0-9-]+(/[a-z0-9-]+)*$')
+      - consul_egress_catalog is defined and consul_egress_catalog is mapping and consul_egress_catalog | length > 0
+      - consul_egress_categories is defined and consul_egress_categories is sequence
+      - consul_egress_categories is not string
+      - consul_egress_categories | difference(consul_egress_catalog.keys() | list) | length == 0
+      - consul_egress_gateway_hosts is defined and consul_egress_gateway_hosts is sequence
+      - consul_egress_gateway_hosts is not string
+      - consul_egress_template_token_file is defined and consul_egress_template_token_file is match('^/[^ ]+$')
+      - consul_egress_template_token_group is defined
+      - consul_egress_template_token_group is match('^[a-z][a-z0-9_-]*$')
+      - consul_egress_operator_dir is defined and consul_egress_operator_dir is match('^/[^ ]+$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        consul_egress_socket                consul_server's unix socket (its HTTP API)
+        consul_egress_bootstrap_token_file  absolute path of the management token consul_server stored
+        consul_egress_kv_prefix             the allow list's K/V prefix (e.g. ai-sandbox/egress)
+        consul_egress_catalog               vars/egress-baseline.yml egress_catalog
+        consul_egress_categories            the catalog categories to seed (each a key of the catalog)
+        consul_egress_gateway_hosts         vars/gateway.yml hosts, which the catalog must never name
+        consul_egress_template_token_file   absolute path of consul-template's read token
+        consul_egress_template_token_group  the group consul-template runs as (consul-template; it reads the token)
+        consul_egress_operator_dir          absolute directory for the operator token (OPERATOR_DIR)
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "{{ consul_egress_kv_prefix }}/baseline: {{ consul_egress_categories | join(', ') }}"
+
+# The catalog's own rules (vars/egress-baseline.yml): checked before any write.
+- name: Assert every catalog entry is a valid host, names no gateway host, and has a reason and a probe
+  ansible.builtin.assert:
+    that:
+      - item.1.host is match('^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$')
+      - item.1.host not in consul_egress_gateway_hosts
+      # A wildcard may not cover a gateway host either.
+      - >-
+        not item.1.host.startswith('*.') or consul_egress_gateway_hosts
+        | select('search', (item.1.host[1:] | regex_escape) ~ '$') | list | length == 0
+      - item.1.reason is defined and item.1.reason is string and item.1.reason | length > 0
+      - item.1.reason is not search('["\\\\]')
+      # The probe is a URL on this entry's host (a concrete name for a wildcard).
+      - item.1.probe is defined and item.1.probe is match('^https://')
+      - >-
+        (item.1.probe | urlsplit('hostname')) == item.1.host
+        or (item.1.host.startswith('*.') and (item.1.probe | urlsplit('hostname')).endswith(item.1.host[1:]))
+    fail_msg: "egress_catalog[{{ item.0.key }}]: {{ item.1 }} breaks a catalog rule (vars/egress-baseline.yml header)"
+    quiet: true
+  loop: "{{ consul_egress_catalog | dict2items | subelements('value.entries') }}"
+  loop_control:
+    label: "{{ item.0.key }}/{{ item.1.host }}"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+# In a dry run on a fresh host Consul is not serving yet; everything below
+# then waits for the real run.
+- name: Check whether Consul has a leader
+  ansible.builtin.uri:
+    url: "{{ consul_egress_url }}/v1/status/leader"
+    unix_socket: "{{ consul_egress_socket }}"
+    return_content: true
+  register: consul_egress_leader
+  check_mode: false
+  failed_when: consul_egress_leader.content | default('') is not match('^"\d') and not ansible_check_mode
+
+- name: Check for the management token
+  ansible.builtin.stat:
+    path: "{{ consul_egress_bootstrap_token_file }}"
+  register: consul_egress_mgmt_stat
+  become: true
+
+- name: Decide whether Consul can be configured in this pass
+  ansible.builtin.set_fact:
+    consul_egress_live: >-
+      {{ consul_egress_leader.content | default('') is match('^"\d') and consul_egress_mgmt_stat.stat.exists }}
+
+- name: Would configure the allow list's tokens and seed the baseline
+  ansible.builtin.debug:
+    msg: "{{ consul_egress_categories | join(', ') }}"
+  changed_when: true
+  when: not consul_egress_live
+
+- name: Build the desired baseline
+  ansible.builtin.set_fact:
+    consul_egress_desired: {}
+
+- name: Add each enabled category
+  ansible.builtin.include_tasks: category.yml
+  loop: "{{ consul_egress_categories }}"
+  loop_control:
+    loop_var: consul_egress_category
+
+- name: Configure the allow list
+  when: consul_egress_live
+  block:
+    - name: Read the management token
+      ansible.builtin.slurp:
+        src: "{{ consul_egress_bootstrap_token_file }}"
+      register: consul_egress_mgmt_b64
+      become: true
+      no_log: true
+
+    - name: Keep the management token for this role's API calls
+      ansible.builtin.set_fact:
+        consul_egress_mgmt_token: "{{ consul_egress_mgmt_b64.content | b64decode | trim }}"
+      no_log: true
+
+    - name: Read the allow-list policies
+      ansible.builtin.uri:
+        url: "{{ consul_egress_url }}/v1/acl/policy/name/{{ item.name }}"
+        unix_socket: "{{ consul_egress_socket }}"
+        headers: { X-Consul-Token: "{{ consul_egress_mgmt_token }}" }
+        status_code: [200, 403, 404]
+      loop: "{{ consul_egress_policies }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: consul_egress_policy_current
+      check_mode: false
+
+    - name: Would create or update an allow-list policy
+      ansible.builtin.debug:
+        msg: "{{ item.item.name }}"
+      changed_when: true
+      loop: "{{ consul_egress_policy_current.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: ansible_check_mode and item.json.Rules | default('') != item.item.rules
+
+    - name: Create or update the allow-list policies
+      ansible.builtin.uri:
+        url: "{{ consul_egress_url }}/v1/acl/policy{{ ('/' ~ item.json.ID) if item.status == 200 else '' }}"
+        unix_socket: "{{ consul_egress_socket }}"
+        method: PUT
+        headers: { X-Consul-Token: "{{ consul_egress_mgmt_token }}" }
+        body_format: json
+        body: { Name: "{{ item.item.name }}", Rules: "{{ item.item.rules }}" }
+      changed_when: true
+      loop: "{{ consul_egress_policy_current.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: not ansible_check_mode and item.json.Rules | default('') != item.item.rules
+
+    - name: Create the operator directory and its env.d
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop: ["{{ consul_egress_operator_dir }}", "{{ consul_egress_operator_dir }}/env.d"]
+
+    # Sourced by OPERATOR_DIR/env.sh (vault_gateway): the consul CLI on the
+    # socket with the operator token (concepts/Operator Interfaces).
+    - name: Write the operator's consul CLI environment
+      ansible.builtin.template:
+        src: consul.env.sh.j2
+        dest: "{{ consul_egress_operator_dir }}/env.d/consul.sh"
+        mode: "0644"
+
+    # envoy_gateway creates consul-template's user later, in this group.
+    - name: Create consul-template's group
+      ansible.builtin.group:
+        name: "{{ consul_egress_template_token_group }}"
+        system: true
+      register: consul_egress_ct_group
+      become: true
+
+    # A dry run does not create the group, so nothing can be given to it yet.
+    - name: Decide whether consul-template's group exists in this pass
+      ansible.builtin.set_fact:
+        consul_egress_ct_group_pending: "{{ ansible_check_mode and consul_egress_ct_group is changed }}"
+
+    - name: Create consul-template's token directory (its group may traverse it)
+      ansible.builtin.file:
+        path: "{{ consul_egress_template_token_file | dirname }}"
+        state: directory
+        owner: root
+        group: "{{ consul_egress_template_token_group }}"
+        mode: "0750"
+      become: true
+      when: not consul_egress_ct_group_pending
+
+    - name: Ensure consul-template's read token and the operator's token
+      ansible.builtin.include_tasks: token.yml
+      loop:
+        - file: "{{ consul_egress_template_token_file }}"
+          owner: root
+          group: "{{ consul_egress_template_token_group }}"
+          mode: "0640"
+          policy: "{{ consul_egress_read_policy }}"
+          description: ai-sandbox consul-template (reads the egress allow list)
+        - file: "{{ consul_egress_operator_token_file }}"
+          owner: "{{ ansible_facts['user_id'] }}"
+          group: "{{ ansible_facts['user_id'] }}"
+          mode: "0600"
+          policy: "{{ consul_egress_operator_policy }}"
+          description: ai-sandbox operator (edits the egress allow list)
+      loop_control:
+        loop_var: consul_egress_token
+        label: "{{ consul_egress_token.file }}"
+      when: not (consul_egress_ct_group_pending and consul_egress_token.group == consul_egress_template_token_group)
+
+    - name: Read the seeded baseline
+      ansible.builtin.uri:
+        url: "{{ consul_egress_url }}/v1/kv/{{ consul_egress_kv_prefix }}/baseline/?recurse=true"
+        unix_socket: "{{ consul_egress_socket }}"
+        headers: { X-Consul-Token: "{{ consul_egress_mgmt_token }}" }
+        status_code: [200, 404]
+      register: consul_egress_current
+      check_mode: false
+
+    - name: Compare the seeded baseline with the catalog
+      ansible.builtin.set_fact:
+        consul_egress_have: >-
+          {{ {} if consul_egress_current.status == 404 else
+             dict(consul_egress_current.json | map(attribute='Key')
+                  | map('regex_replace', '^' ~ (consul_egress_kv_prefix | regex_escape) ~ '/baseline/', '')
+                  | zip(consul_egress_current.json | map(attribute='Value') | map('default', '', true)
+                        | map('b64decode'))) }}
+
+    - name: Would seed or update a baseline entry
+      ansible.builtin.debug:
+        msg: "{{ item.key }}"
+      changed_when: true
+      loop: "{{ consul_egress_desired | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: ansible_check_mode and consul_egress_have.get(item.key) != item.value
+
+    - name: Seed or update the baseline entries
+      ansible.builtin.uri:
+        url: "{{ consul_egress_url }}/v1/kv/{{ consul_egress_kv_prefix }}/baseline/{{ item.key | urlencode }}"
+        unix_socket: "{{ consul_egress_socket }}"
+        method: PUT
+        headers: { X-Consul-Token: "{{ consul_egress_mgmt_token }}" }
+        body: "{{ item.value }}"
+      changed_when: true
+      loop: "{{ consul_egress_desired | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: not ansible_check_mode and consul_egress_have.get(item.key) != item.value
+
+    - name: Would prune a stale baseline entry
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      changed_when: true
+      loop: "{{ consul_egress_have.keys() | difference(consul_egress_desired.keys()) }}"
+      when: ansible_check_mode
+
+    - name: Prune stale baseline entries
+      ansible.builtin.uri:
+        url: "{{ consul_egress_url }}/v1/kv/{{ consul_egress_kv_prefix }}/baseline/{{ item | urlencode }}"
+        unix_socket: "{{ consul_egress_socket }}"
+        method: DELETE
+        headers: { X-Consul-Token: "{{ consul_egress_mgmt_token }}" }
+      changed_when: true
+      loop: "{{ consul_egress_have.keys() | difference(consul_egress_desired.keys()) }}"
+      when: not ansible_check_mode
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the seeded baseline is exactly the enabled catalog, and the
+# operator token cannot write it. Skipped only in a dry run on a host without
+# Consul.
+# ---------------------------------------------------------------------------
+- name: Re-read the seeded baseline's keys
+  ansible.builtin.uri:
+    url: "{{ consul_egress_url }}/v1/kv/{{ consul_egress_kv_prefix }}/baseline/?keys=true"
+    unix_socket: "{{ consul_egress_socket }}"
+    headers: { X-Consul-Token: "{{ consul_egress_mgmt_token }}" }
+    status_code: [200, 404]
+  register: consul_egress_keys
+  check_mode: false
+  when: consul_egress_live and not ansible_check_mode
+
+- name: Read the operator token
+  ansible.builtin.slurp:
+    src: "{{ consul_egress_operator_token_file }}"
+  register: consul_egress_operator_b64
+  no_log: true
+  when: consul_egress_live and not ansible_check_mode
+
+# A denied write changes nothing.
+- name: Try to write the baseline with the operator token
+  ansible.builtin.uri:
+    url: "{{ consul_egress_url }}/v1/kv/{{ consul_egress_kv_prefix }}/baseline/operator-probe"
+    unix_socket: "{{ consul_egress_socket }}"
+    method: PUT
+    headers: { X-Consul-Token: "{{ consul_egress_operator_b64.content | b64decode | trim }}" }
+    body: probe
+    status_code: [200, 403]
+  register: consul_egress_operator_probe
+  check_mode: false
+  when: consul_egress_live and not ansible_check_mode
+
+- name: Assert the baseline is exactly the enabled catalog, and Ansible-owned
+  ansible.builtin.assert:
+    that:
+      - >-
+        consul_egress_keys.json | default([]) | map('regex_replace', '^' ~ (consul_egress_kv_prefix | regex_escape)
+        ~ '/baseline/', '') | sort == consul_egress_desired.keys() | sort
+      - consul_egress_operator_probe.status == 403
+    fail_msg: >-
+      baseline keys {{ consul_egress_keys.json | default([]) | length }}, catalog {{ consul_egress_desired | length }};
+      operator write to baseline/ returned {{ consul_egress_operator_probe.status }} (expected 403)
+    success_msg: >-
+      {{ consul_egress_desired | length }} baseline entries from {{ consul_egress_categories | length }} categories
+  when: consul_egress_live and not ansible_check_mode
+...

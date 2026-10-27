@@ -1,0 +1,336 @@
+---
+# Trust an operator-supplied CA chain on the guest, system wide, before
+# anything on the guest needs the network. In ai-sandbox that is the gateway
+# CA: Envoy's TLS gateway presents a certificate it signs for github.com,
+# api.anthropic.com, ...; until it is trusted, git, curl, Claude Code and
+# every downloader fail there. It serves any TLS-intercepting proxy the same
+# way: vm-baseline.yml applies it a second time, optionally, for the chain of
+# a TLS-inspecting proxy (Zscaler, ...) in front of the host.
+#
+# Uses copy and command only, never the package module, so it works on a
+# fresh guest before dnf can reach anything.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - ca_trust_variant in ca_trust_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      ca_trust supports {{ ca_trust_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ ca_trust_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: ca_trust_whoami
+  changed_when: false
+  check_mode: false
+
+- name: Assert that the role runs in the system lane
+  ansible.builtin.assert:
+    that: ca_trust_whoami.stdout == 'root'
+    fail_msg: >-
+      ca_trust writes the system trust store and must run as root: apply it from a
+      play with become: true (it ran as {{ ca_trust_whoami.stdout }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - ca_trust_src_dir is defined and ca_trust_src_dir is match('^/[^ ]+$')
+      - ca_trust_name is defined and ca_trust_name is match('^[a-z0-9][a-z0-9-]*$')
+      - ca_trust_required is defined and ca_trust_required is boolean
+      - ca_trust_probe_urls is defined and ca_trust_probe_urls is sequence and ca_trust_probe_urls is not string
+      - ca_trust_probe_urls | length > 0
+      - ca_trust_probe_urls | reject('match', '^https://[^ ]+$') | list | length == 0
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        ca_trust_src_dir     absolute path ON THE CONTROLLER holding the chain as *.pem / *.crt
+                             (lab-config.mk CA_TRUST_DIR, passed as -e ca_trust_dir=...)
+        ca_trust_name        lowercase name for the anchor files, e.g. ai-sandbox-gateway
+        ca_trust_required    true: the directory must hold a chain; false: an empty or missing
+                             directory removes this name's anchors (the chain is optional)
+        ca_trust_probe_urls  non-empty list of https:// URLs the guest must reach afterwards
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      {{ ca_trust_name }} chain from {{ ca_trust_src_dir }} ({{ 'required' if ca_trust_required else 'optional' }});
+      probes: {{ ca_trust_probe_urls | join(', ') }}
+
+# ---------------------------------------------------------------------------
+# THE CHAIN, read and checked on the controller. Nothing reaches the guest
+# unless every PEM object is an unexpired CA certificate.
+# ---------------------------------------------------------------------------
+- name: Find the chain files in {{ ca_trust_src_dir }}
+  ansible.builtin.set_fact:
+    ca_trust_src_files: >-
+      {{ (query('ansible.builtin.fileglob', ca_trust_src_dir ~ '/*.pem')
+          + query('ansible.builtin.fileglob', ca_trust_src_dir ~ '/*.crt')) | sort }}
+
+- name: Assert that the chain was exported
+  ansible.builtin.assert:
+    that: ca_trust_src_files | length > 0 or not ca_trust_required
+    fail_msg: >-
+      No *.pem or *.crt in {{ ca_trust_src_dir }} on the controller. The gateway
+      playbook exports the gateway CA there: make -f lab-gateway.mk gateway TAGS=pki
+    quiet: true
+
+- name: Split the chain into PEM objects
+  ansible.builtin.set_fact:
+    # Double-quoted: YAML turns \n into a newline (a folded scalar would not).
+    ca_trust_pems: "{{ (query('ansible.builtin.file', *ca_trust_src_files) | join('\n')
+      | community.crypto.split_pem) if ca_trust_src_files | length > 0 else [] }}"
+
+# A private key in the chain directory must never be copied to a guest.
+- name: Assert that every PEM object is a certificate
+  ansible.builtin.assert:
+    that:
+      - ca_trust_pems | length > 0 or ca_trust_src_files | length == 0
+      - ca_trust_pems | reject('match', '^-----BEGIN CERTIFICATE-----') | list | length == 0
+    fail_msg: >-
+      {{ ca_trust_src_files | join(', ') }} must hold only certificates; found
+      {{ ca_trust_pems | map('regex_search', '^-----BEGIN [A-Z0-9 ]+-----') | list }}.
+    quiet: true
+
+- name: Start with no certificates read
+  ansible.builtin.set_fact:
+    ca_trust_certs: []
+    ca_trust_anchors: []
+
+- name: Read each certificate
+  ansible.builtin.set_fact:
+    ca_trust_certs: >-
+      {{ ca_trust_certs + [{
+           'pem': item | trim,
+           'info': ca_trust_info,
+           'subject': ca_trust_info.subject_ordered | map('join', '=') | join(', ')
+         }] }}
+  vars:
+    ca_trust_info: "{{ item | community.crypto.x509_certificate_info }}"
+  loop: "{{ ca_trust_pems }}"
+  loop_control:
+    index_var: ca_trust_idx
+    label: "PEM object {{ ca_trust_idx + 1 }} of {{ ca_trust_pems | length }}"
+
+- name: Assert that every certificate is an unexpired CA
+  ansible.builtin.assert:
+    that:
+      - not item.info.expired
+      - "'CA:TRUE' in (item.info.basic_constraints or [])"
+    fail_msg: >-
+      {{ item.subject }} is {{ 'EXPIRED (notAfter ' ~ item.info.not_after ~ ')' if item.info.expired
+      else 'not a CA certificate (basicConstraints ' ~ item.info.basic_constraints ~ ')' }}; only CA
+      certificates belong in the trust store.
+    success_msg: "{{ item.subject }} sha256 {{ item.info.fingerprints.sha256 }} (until {{ item.info.not_after }})"
+  loop: "{{ ca_trust_certs }}"
+  loop_control:
+    label: "{{ item.subject }}"
+
+# One anchor file per certificate, named by its fingerprint: re-exporting the
+# same chain is a no-op, and a rotated certificate replaces the old file.
+- name: Name the anchor files
+  ansible.builtin.set_fact:
+    ca_trust_anchors: >-
+      {{ ca_trust_anchors + [{
+           'path': ca_trust_anchor_dir ~ '/' ~ ca_trust_name ~ '-'
+                   ~ (item.info.fingerprints.sha256 | replace(':', '') | lower)[:16] ~ '.pem',
+           'pem': item.pem,
+           'subject': item.subject
+         }] }}
+  loop: "{{ ca_trust_certs }}"
+  loop_control:
+    label: "{{ item.subject }}"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS — on the guest.
+# ---------------------------------------------------------------------------
+- name: Stat the system trust tooling
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ ca_trust_anchor_dir }}"
+    - "{{ ca_trust_update_bin }}"
+    - "{{ ca_trust_bundle }}"
+  register: ca_trust_tooling
+
+- name: Assert that this guest uses the p11-kit/update-ca-trust layout
+  ansible.builtin.assert:
+    that: ca_trust_tooling.results | map(attribute='stat.exists') | min
+    fail_msg: >-
+      Missing {{ ca_trust_tooling.results | rejectattr('stat.exists') | map(attribute='item') | join(', ') }};
+      ca_trust supports the Fedora/EL ca-certificates layout only.
+    quiet: true
+
+- name: Install the anchor files
+  ansible.builtin.copy:
+    content: "{{ item.pem }}\n"
+    dest: "{{ item.path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ ca_trust_anchors }}"
+  loop_control:
+    label: "{{ item.path | basename }} ({{ item.subject }})"
+  register: ca_trust_installed
+
+- name: Find this role's anchor files from earlier runs
+  ansible.builtin.find:
+    paths: "{{ ca_trust_anchor_dir }}"
+    patterns: "{{ ca_trust_name }}-*.pem"
+  register: ca_trust_existing
+
+- name: Remove anchor files that are no longer in the chain
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ ca_trust_existing.files | map(attribute='path')
+       | difference(ca_trust_anchors | map(attribute='path')) | list }}
+  register: ca_trust_removed
+
+# check-mode: the anchor copy and removal tasks above report the change.
+- name: Rebuild the extracted trust bundles
+  ansible.builtin.command: "{{ ca_trust_update_bin }} extract"
+  changed_when: true
+  when: ca_trust_installed is changed or ca_trust_removed is changed
+
+- name: Ensure /etc/environment.d exists (EL does not ship it)
+  ansible.builtin.file:
+    path: "{{ ca_trust_environment_d | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Tools that ignore the system store and ship their own roots read these.
+# Each names the system bundle, so they trust exactly what dnf and curl do.
+- name: Point bundle-carrying tools at the system bundle
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: ca-trust.profile.sh.j2, dest: "{{ ca_trust_profile_hook }}" }
+    - { src: ca-trust.environment.conf.j2, dest: "{{ ca_trust_environment_d }}" }
+  loop_control:
+    label: "{{ item.dest }}"
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — skipped only in a dry run that has anchors pending, because
+# the bundle cannot hold them until the real run extracts it.
+# ---------------------------------------------------------------------------
+- name: Decide whether the trust store can be verified
+  ansible.builtin.set_fact:
+    ca_trust_verifiable: >-
+      {{ not ansible_check_mode or not (ca_trust_installed is changed or ca_trust_removed is changed) }}
+
+# An optional chain that is absent has nothing to prove: its anchors are gone.
+- name: Report that the optional chain is not in use
+  ansible.builtin.debug:
+    msg: "No {{ ca_trust_name }} chain in {{ ca_trust_src_dir }}: none of its anchors is installed."
+  when: ca_trust_anchors | length == 0
+
+# -partial_chain: an intermediate that is itself an anchor verifies without
+# its root, which is how p11-kit treats it too.
+- name: Verify that OpenSSL trusts each anchor through the system bundle
+  ansible.builtin.command:
+    argv: [openssl, verify, -partial_chain, -CAfile, "{{ ca_trust_bundle }}", "{{ item.path }}"]
+  loop: "{{ ca_trust_anchors }}"
+  loop_control:
+    label: "{{ item.subject }}"
+  register: ca_trust_verify
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: ca_trust_verifiable
+
+- name: Assert that every certificate is in the system bundle
+  ansible.builtin.assert:
+    that: item.rc == 0
+    fail_msg: >-
+      {{ item.item.subject }} is not trusted through {{ ca_trust_bundle }}:
+      {{ item.stdout }} {{ item.stderr }}
+    quiet: true
+  loop: "{{ ca_trust_verify.results }}"
+  loop_control:
+    label: "{{ item.item.subject }}"
+  when: ca_trust_verifiable
+
+# The end-to-end check: the guest really reaches the internet through the
+# interception. Only the handshake and a status line are needed, so curl sends
+# HEAD; it exits 0 on any HTTP status, so only TLS or network failures fail.
+- name: Probe each URL with curl (the system store)
+  ansible.builtin.command:
+    argv:
+      - curl
+      - --head
+      - --silent
+      - --show-error
+      - --output
+      - /dev/null
+      - --max-time
+      - "30"
+      - --write-out
+      - "%{http_code}"
+      - "{{ item }}"
+  loop: "{{ ca_trust_probe_urls }}"
+  register: ca_trust_curl
+  # A public site occasionally leaves a connection unanswered (Envoy's 5 s
+  # connect timeout, 503 UF): retry before calling it a trust failure.
+  until: ca_trust_curl.rc == 0
+  retries: 2
+  delay: 5
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: ca_trust_verifiable and ca_trust_anchors | length > 0
+
+- name: Probe each URL with Python's ssl module (what Ansible itself downloads with)
+  ansible.builtin.command:
+    argv: ["{{ ansible_facts['python']['executable'] }}", -c, "{{ ca_trust_python_probe }}", "{{ item }}"]
+  loop: "{{ ca_trust_probe_urls }}"
+  register: ca_trust_python
+  # A public site occasionally leaves a connection unanswered (Envoy's 5 s
+  # connect timeout, 503 UF): retry before calling it a trust failure.
+  until: ca_trust_python.rc == 0
+  retries: 2
+  delay: 5
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: ca_trust_verifiable and ca_trust_anchors | length > 0
+
+- name: Assert that every URL is reachable over verified TLS
+  ansible.builtin.assert:
+    that:
+      - item.0.rc == 0
+      - item.1.rc == 0
+    fail_msg: >-
+      {{ item.0.item }} failed over TLS from the guest. curl rc={{ item.0.rc }}: {{ item.0.stderr | trim }};
+      python rc={{ item.1.rc }}: {{ item.1.stderr | trim }}. If curl reports a certificate problem, the
+      exported chain is not the one intercepting this guest's traffic; if it times out, the proxy may
+      need HTTPS_PROXY instead of trust.
+    success_msg: "{{ item.0.item }}: HTTP {{ item.0.stdout }} over verified TLS (curl and python)"
+  loop: "{{ ca_trust_curl.results | zip(ca_trust_python.results) | list }}"
+  loop_control:
+    label: "{{ item.0.item }}"
+  when: ca_trust_verifiable and ca_trust_anchors | length > 0
+...

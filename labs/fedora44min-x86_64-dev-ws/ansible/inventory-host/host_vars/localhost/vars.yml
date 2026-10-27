@@ -1,0 +1,21 @@
+---
+# The gateway's REAL credentials, by secret name: each surrogate in
+# vars/gateway.yml names one (secret:), and the gateway playbook writes it
+# into Vault, never to a guest. The values live encrypted in vault.yml beside
+# this file (ansible-vault, the lab's .ansible_vault_key; gitignored), as
+# <name>_secret variables. Set or rotate one, at a hidden prompt:
+#
+#   make -f lab-gateway.mk secrets NAME=private-scratch-1
+#
+# github_repos keys (vars/gateway.yml): a fine-grained PAT limited to that one
+# repository, with read access to its contents and metadata.
+# anthropic: an Anthropic API key.
+#
+# This host inventory is the only one that holds them: the guest inventory
+# (inventory/) never loads it.
+gateway_secrets:
+  private-scratch-1: "{{ github_pat_private_scratch_1_secret }}"
+  private-scratch-2: "{{ github_pat_private_scratch_2_secret }}"
+  private-scratch-3: "{{ github_pat_private_scratch_3_secret }}"
+  anthropic: "{{ anthropic_api_key_secret }}"
+...

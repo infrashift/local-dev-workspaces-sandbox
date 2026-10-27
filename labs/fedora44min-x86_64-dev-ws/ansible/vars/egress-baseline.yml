@@ -1,0 +1,330 @@
+---
+# The egress baseline catalog: every site the sandbox may reach through the
+# CONNECT tunnel (GATEWAY_IP:PROXY_PORT) without an operator entry.
+#
+# The gateway playbook seeds the enabled categories into Consul K/V under
+#   ai-sandbox/egress/baseline/<category>/<host>:<port>
+# and prunes every baseline key that is no longer here (or whose category is
+# turned off), so this file is the baseline's single source. Operator entries
+# live beside it under ai-sandbox/egress/allow/ and are never touched by
+# Ansible: make -f lab-gateway.mk allow|deny|allowlist.
+#
+# Rules (concepts/Egress Baseline Catalog):
+#   * HTTPS only: the tunnel is CONNECT-only, so plain-http repositories are
+#     refused by design.
+#   * A wildcard ("*.example.com") only for ONE vendor's own CDN names, never
+#     a shared cloud (*.cloudfront.net, *.amazonaws.com, *.googleapis.com).
+#   * Hosts the TLS gateway serves (vars/gateway.yml) never appear here: a
+#     tunnel to them would bypass surrogate injection. Nor does any subdomain
+#     of one: the guests' NO_PROXY names the gateway hosts, and clients match
+#     NO_PROXY as a domain suffix, so they would skip the tunnel for it (make
+#     it a gateway route instead, as codeload.github.com is).
+#   * Every entry has a probe: a URL on that host (a concrete name for a
+#     wildcard) that tests/guest/sandbox/test_egress_catalog.py fetches through
+#     the tunnel. Redirect targets found while probing are added as their own
+#     entries.
+#
+# Which categories are seeded: the gateway playbook's egress_baseline_categories.
+
+egress_catalog:
+  rpm-fedora:
+    description: Fedora packages for dnf, from the one pinned mirror (vm-baseline's sandbox_egress)
+    entries:
+      - host: mirrors.kernel.org
+        reason: the pinned Fedora mirror dnf's baseurl names (releases and updates)
+        probe: https://mirrors.kernel.org/fedora/releases/44/Everything/x86_64/os/repodata/repomd.xml
+      - host: mirrors.fedoraproject.org
+        reason: Fedora metalink/mirrorlist service (EPEL, and dnf when the pin is lifted)
+        probe: https://mirrors.fedoraproject.org/metalink?repo=fedora-44&arch=x86_64
+      - host: dl.fedoraproject.org
+        reason: Fedora and EPEL primary mirror
+        probe: https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/repodata/repomd.xml
+      - host: download.fedoraproject.org
+        reason: Fedora download redirector (cloud images, ISOs)
+        probe: https://download.fedoraproject.org/pub/fedora/linux/releases/
+      - host: fedoraproject.org
+        reason: Fedora signing keys (fedora.gpg)
+        probe: https://fedoraproject.org/fedora.gpg
+
+  rpm-redhat:
+    description: RHEL (CDN and UBI), CentOS Stream, Rocky Linux and AlmaLinux repositories for dnf/yum
+    entries:
+      - host: cdn.redhat.com
+        reason: RHEL content CDN (subscribed hosts)
+        probe: https://cdn.redhat.com/
+      - host: cdn-ubi.redhat.com
+        reason: UBI repositories (no subscription needed)
+        probe: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/repodata/repomd.xml
+      - host: subscription.rhsm.redhat.com
+        reason: subscription-manager registration and entitlement
+        probe: https://subscription.rhsm.redhat.com/subscription/
+      - host: cert-api.access.redhat.com
+        reason: subscription-manager certificate API
+        probe: https://cert-api.access.redhat.com/
+      - host: mirrors.centos.org
+        reason: CentOS Stream mirror list
+        probe: https://mirrors.centos.org/
+      - host: mirror.stream.centos.org
+        reason: CentOS Stream primary mirror
+        probe: https://mirror.stream.centos.org/
+      - host: dl.rockylinux.org
+        reason: Rocky Linux primary mirror
+        probe: https://dl.rockylinux.org/pub/rocky/
+      - host: mirrors.rockylinux.org
+        reason: Rocky Linux mirror list
+        probe: https://mirrors.rockylinux.org/
+      - host: repo.almalinux.org
+        reason: AlmaLinux primary mirror
+        probe: https://repo.almalinux.org/almalinux/
+      - host: mirrors.almalinux.org
+        reason: AlmaLinux mirror list
+        probe: https://mirrors.almalinux.org/
+
+  python:
+    description: PyPI, conda and the uv/ruff installers
+    entries:
+      - host: pypi.org
+        reason: PyPI simple index and JSON API (pip, uv)
+        probe: https://pypi.org/simple/pip/
+      - host: files.pythonhosted.org
+        reason: PyPI distribution files
+        probe: https://files.pythonhosted.org/
+      - host: conda.anaconda.org
+        reason: conda-forge and other conda channels
+        probe: https://conda.anaconda.org/conda-forge/noarch/repodata.json.bz2
+      - host: repo.anaconda.com
+        reason: Anaconda default channels
+        probe: https://repo.anaconda.com/pkgs/
+      - host: astral.sh
+        reason: uv and ruff installer scripts
+        probe: https://astral.sh/uv/install.sh
+
+  go:
+    description: Go module proxy, checksum database, toolchains and vanity import hosts
+    entries:
+      - host: proxy.golang.org
+        reason: GOPROXY default
+        probe: https://proxy.golang.org/golang.org/x/text/@v/list
+      - host: sum.golang.org
+        reason: GOSUMDB default
+        probe: https://sum.golang.org/latest
+      - host: index.golang.org
+        reason: module index
+        probe: https://index.golang.org/index?limit=1
+      - host: go.dev
+        reason: toolchain downloads (go.dev/dl) and docs
+        probe: https://go.dev/dl/?mode=json
+      - host: golang.org
+        reason: golang.org/x vanity import meta tags
+        probe: https://golang.org/x/text?go-get=1
+      - host: dl.google.com
+        reason: Go toolchain archives (go.dev/dl redirects here; GOTOOLCHAIN)
+        probe: https://dl.google.com/go/
+      - host: go.googlesource.com
+        reason: golang.org/x sources with GOPROXY=direct
+        probe: https://go.googlesource.com/text/+/refs/heads/master?format=TEXT
+      - host: gopkg.in
+        reason: gopkg.in versioned imports
+        probe: https://gopkg.in/yaml.v3?go-get=1
+
+  frontend:
+    description: npm, Yarn, Node.js, JSR, Deno, Bun and the npm CDNs
+    entries:
+      - host: registry.npmjs.org
+        reason: npm registry
+        probe: https://registry.npmjs.org/left-pad
+      - host: registry.yarnpkg.com
+        reason: Yarn classic registry mirror
+        probe: https://registry.yarnpkg.com/left-pad
+      - host: repo.yarnpkg.com
+        reason: Yarn Berry releases (corepack)
+        probe: https://repo.yarnpkg.com/tags
+      - host: nodejs.org
+        reason: Node.js releases and headers (node-gyp, corepack)
+        probe: https://nodejs.org/dist/index.json
+      - host: jsr.io
+        reason: JSR registry
+        probe: https://jsr.io/@std/path/meta.json
+      - host: npm.jsr.io
+        reason: JSR's npm-compatible registry
+        probe: https://npm.jsr.io/
+      - host: deno.land
+        reason: deno.land/x and the Deno install script
+        probe: https://deno.land/x/
+      - host: dl.deno.land
+        reason: Deno releases
+        probe: https://dl.deno.land/release-latest.txt
+      - host: bun.sh
+        reason: Bun install script and releases
+        probe: https://bun.sh/install
+      - host: unpkg.com
+        reason: npm package CDN
+        probe: https://unpkg.com/left-pad/package.json
+      - host: cdn.jsdelivr.net
+        reason: npm and GitHub package CDN
+        probe: https://cdn.jsdelivr.net/npm/left-pad/package.json
+
+  rust:
+    description: crates.io and rustup
+    entries:
+      - host: crates.io
+        reason: crates.io API (cargo search, publish metadata)
+        probe: https://crates.io/api/v1/crates/serde
+      - host: index.crates.io
+        reason: sparse registry index
+        probe: https://index.crates.io/config.json
+      - host: static.crates.io
+        reason: crate downloads
+        probe: https://static.crates.io/
+      - host: static.rust-lang.org
+        reason: rustup toolchains and components
+        probe: https://static.rust-lang.org/dist/channel-rust-stable.toml.sha256
+      - host: sh.rustup.rs
+        reason: rustup installer script
+        probe: https://sh.rustup.rs/
+
+  java:
+    description: Maven Central, the Gradle plugin portal and distributions, Adoptium JDKs
+    entries:
+      - host: repo.maven.apache.org
+        reason: Maven Central (Maven's default)
+        probe: https://repo.maven.apache.org/maven2/junit/junit/maven-metadata.xml
+      - host: repo1.maven.org
+        reason: Maven Central (Gradle's mavenCentral())
+        probe: https://repo1.maven.org/maven2/junit/junit/maven-metadata.xml
+      - host: central.sonatype.com
+        reason: Maven Central search and portal
+        probe: https://central.sonatype.com/
+      - host: plugins.gradle.org
+        reason: Gradle plugin portal
+        probe: https://plugins.gradle.org/m2/
+      - host: plugins-artifacts.gradle.org
+        reason: Gradle plugin portal artifacts (plugins.gradle.org redirects here)
+        probe: https://plugins-artifacts.gradle.org/
+      - host: services.gradle.org
+        reason: Gradle wrapper distributions
+        probe: https://services.gradle.org/versions/current
+      - host: downloads.gradle.org
+        reason: Gradle distribution downloads (services.gradle.org redirects here)
+        probe: https://downloads.gradle.org/
+      - host: api.adoptium.net
+        reason: Adoptium (Temurin) JDK API
+        probe: https://api.adoptium.net/v3/info/available_releases
+
+  ansible:
+    description: Ansible Galaxy and Automation Hub
+    entries:
+      - host: galaxy.ansible.com
+        reason: Galaxy API (collections and roles)
+        probe: https://galaxy.ansible.com/api/
+      - host: ansible-galaxy-ng.s3.dualstack.us-east-1.amazonaws.com
+        reason: >-
+          Galaxy collection artifacts (galaxy.ansible.com redirects downloads here); one bucket, not
+          *.amazonaws.com
+        probe: https://ansible-galaxy-ng.s3.dualstack.us-east-1.amazonaws.com/
+      - host: console.redhat.com
+        reason: Automation Hub (certified collections)
+        probe: https://console.redhat.com/api/automation-hub/
+
+  terraform:
+    description: Terraform and OpenTofu registries and HashiCorp releases
+    entries:
+      - host: registry.terraform.io
+        reason: Terraform provider and module registry
+        probe: https://registry.terraform.io/.well-known/terraform.json
+      - host: releases.hashicorp.com
+        reason: HashiCorp provider and tool downloads
+        probe: https://releases.hashicorp.com/
+      - host: registry.opentofu.org
+        reason: OpenTofu registry
+        probe: https://registry.opentofu.org/.well-known/terraform.json
+
+  source-hosts:
+    description: >-
+      GitHub's content and release-asset hosts, GitLab and Bitbucket (github.com, codeload.github.com,
+      api.github.com and raw.githubusercontent.com go through the TLS gateway instead)
+    entries:
+      - host: objects.githubusercontent.com
+        reason: GitHub release assets (github.com/.../releases/download redirects here)
+        probe: https://objects.githubusercontent.com/
+      - host: release-assets.githubusercontent.com
+        reason: GitHub release assets (newer redirect target)
+        probe: https://release-assets.githubusercontent.com/
+      - host: gitlab.com
+        reason: GitLab-hosted sources (go modules, git clones)
+        probe: https://gitlab.com/
+      - host: bitbucket.org
+        reason: Bitbucket-hosted sources
+        probe: https://bitbucket.org/
+
+  oci-registries:
+    description: Docker Hub, Quay, GHCR, the Fedora and Red Hat registries, MCR, Google, Kubernetes and ECR Public
+    entries:
+      - host: registry-1.docker.io
+        reason: Docker Hub registry API
+        probe: https://registry-1.docker.io/v2/
+      - host: auth.docker.io
+        reason: Docker Hub token service
+        probe: https://auth.docker.io/token?service=registry.docker.io
+      - host: index.docker.io
+        reason: Docker Hub index (docker.io short names)
+        probe: https://index.docker.io/v2/
+      - host: production.cloudflare.docker.com
+        reason: Docker Hub blob CDN
+        probe: https://production.cloudflare.docker.com/
+      - host: quay.io
+        reason: Quay registry API
+        probe: https://quay.io/v2/
+      - host: cdn.quay.io
+        reason: Quay blob CDN
+        probe: https://cdn.quay.io/
+      - host: cdn01.quay.io
+        reason: Quay blob CDN
+        probe: https://cdn01.quay.io/
+      - host: cdn02.quay.io
+        reason: Quay blob CDN
+        probe: https://cdn02.quay.io/
+      - host: cdn03.quay.io
+        reason: Quay blob CDN
+        probe: https://cdn03.quay.io/
+      - host: ghcr.io
+        reason: GitHub Container Registry
+        probe: https://ghcr.io/v2/
+      - host: pkg-containers.githubusercontent.com
+        reason: GHCR blob storage (ghcr.io redirects here)
+        probe: https://pkg-containers.githubusercontent.com/
+      - host: registry.fedoraproject.org
+        reason: Fedora container registry
+        probe: https://registry.fedoraproject.org/v2/
+      - host: cdn.registry.fedoraproject.org
+        reason: Fedora registry blob CDN
+        probe: https://cdn.registry.fedoraproject.org/
+      - host: registry.access.redhat.com
+        reason: Red Hat UBI registry (no login)
+        probe: https://registry.access.redhat.com/v2/
+      - host: registry.redhat.io
+        reason: Red Hat authenticated registry
+        probe: https://registry.redhat.io/v2/
+      - host: mcr.microsoft.com
+        reason: Microsoft Container Registry
+        probe: https://mcr.microsoft.com/v2/
+      - host: "*.data.mcr.microsoft.com"
+        reason: MCR blob CDN (regional names, all Microsoft's)
+        probe: https://eastus.data.mcr.microsoft.com/
+      - host: gcr.io
+        reason: Google Container Registry (distroless and others)
+        probe: https://gcr.io/v2/
+      - host: registry.k8s.io
+        reason: Kubernetes image registry
+        probe: https://registry.k8s.io/v2/
+      - host: public.ecr.aws
+        reason: Amazon ECR Public
+        probe: https://public.ecr.aws/v2/
+
+  claude:
+    description: Claude Code releases (api.anthropic.com goes through the TLS gateway instead)
+    entries:
+      - host: downloads.claude.ai
+        reason: Claude Code native builds and their manifests (the claude_code role)
+        probe: https://downloads.claude.ai/claude-code-releases/stable
+...

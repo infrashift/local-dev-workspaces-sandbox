@@ -1,0 +1,9 @@
+---
+# Ansible collections for the host-bootstrap and guest playbooks, installed
+# into .collections/ by `make -f labs/<lab>/lab-bootstrap.mk collections`.
+# Exact pins: bump deliberately, like requirements.txt.
+collections:
+  - name: community.general
+    version: "13.5.0"
+  - name: community.crypto
+    version: "3.5.1"

@@ -1,0 +1,10 @@
+# {{ ca_trust_profile_hook }}
+# {{ ansible_managed }} (ai-sandbox ca_trust role); edits are overwritten.
+#
+# Tools that ship their own root certificates ignore the system trust store,
+# so the chains installed there (the gateway CA, and a TLS-inspecting proxy's
+# when there is one) would not reach them. Point each at the system bundle
+# instead.
+{% for k, v in ca_trust_env.items() %}
+export {{ k }}={{ v | quote }}
+{% endfor %}

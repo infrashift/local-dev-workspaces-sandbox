@@ -1,0 +1,159 @@
+---
+# The dev user's SURROGATE credentials (concepts/Surrogate Credential Model):
+#   ~/.config/ai-sandbox/git-surrogates
+#                             read by a get-only git credential helper, so `git clone
+#                             https://github.com/<owner>/<repo>` answers
+#                             GitHub's 401 with that repository's surrogate,
+#                             which the gateway swaps for its own PAT; git
+#                             matches the path (credential.<host>.useHttpPath)
+#                             wherever a surrogate is bound to a repository
+#   ~/.bashrc.d/...           AI_SANDBOX_<NAME>_SURROGATE for scripts and agents
+# None of them works anywhere except through the gateway, for its bound hosts.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - sandbox_surrogates_variant in sandbox_surrogates_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      sandbox_surrogates supports {{ sandbox_surrogates_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ sandbox_surrogates_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Assert that the play names the account it provisions
+  ansible.builtin.assert:
+    that: guest_user is defined and guest_user is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: "Set guest_user (the account this user-lane role configures) at the play level."
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: sandbox_surrogates_whoami
+  changed_when: false
+  check_mode: false
+
+- name: Assert that the role runs in the user lane, as guest_user
+  ansible.builtin.assert:
+    that:
+      - sandbox_surrogates_whoami.stdout == guest_user
+      - ansible_facts['user_id'] == guest_user
+    fail_msg: >-
+      sandbox_surrogates writes {{ guest_user }}'s home and must run as that account, without become
+      (it ran as {{ sandbox_surrogates_whoami.stdout }}; facts as {{ ansible_facts['user_id'] }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - sandbox_surrogates_surrogates is defined and sandbox_surrogates_surrogates is mapping
+      - sandbox_surrogates_surrogates | length > 0
+      # SHAPE VALIDATION: rendered into a shell file and a credential store.
+      - >-
+        sandbox_surrogates_surrogates.values() | map(attribute='credential')
+        | reject('match', '^[A-Za-z0-9._:@-]+$') | list | length == 0
+      - >-
+        sandbox_surrogates_surrogates.values() | selectattr('scheme', 'eq', 'basic')
+        | map(attribute='credential') | reject('search', ':') | list | length == 0
+      - >-
+        sandbox_surrogates_surrogates.values() | selectattr('repo', 'defined') | map(attribute='repo')
+        | reject('match', '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') | list | length == 0
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass:
+        sandbox_surrogates_surrogates  vars/gateway.yml surrogates: {name: {credential (letters, digits,
+                                       . _ : @ - only; basic: user:password), scheme, target_hosts,
+                                       repo (optional, owner/name)}}
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "surrogates: {{ sandbox_surrogates_surrogates.keys() | join(', ') }}"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Ensure ~/.bashrc.d and ~/.config/ai-sandbox exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - "{{ sandbox_surrogates_env_file | dirname }}"
+    - "{{ sandbox_surrogates_git_credentials | dirname }}"
+
+- name: Write the surrogates
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "0600"
+  loop:
+    - { src: git-credentials.j2, dest: "{{ sandbox_surrogates_git_credentials }}" }
+    - { src: surrogates.sh.j2, dest: "{{ sandbox_surrogates_env_file }}" }
+  loop_control:
+    label: "{{ item.dest }}"
+
+- name: Point git at the surrogates, read only
+  community.general.git_config:
+    scope: global
+    name: credential.helper
+    value: "{{ sandbox_surrogates_git_helper }}"
+
+- name: Remove the former credential store (this role wrote it whole; git could erase entries in it)
+  ansible.builtin.file:
+    path: "{{ sandbox_surrogates_former_git_credentials }}"
+    state: absent
+
+- name: Match the repository path for the hosts with per-repository surrogates
+  community.general.git_config:
+    scope: global
+    name: "credential.https://{{ item }}.useHttpPath"
+    value: "true"
+  loop: "{{ sandbox_surrogates_path_hosts }}"
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — git answers a credential request for every bound Basic host
+# with its surrogate. Skipped in a dry run that would write them.
+# ---------------------------------------------------------------------------
+# check-mode: read-only, so it runs in a dry run too.
+- name: Ask git for each Basic surrogate's credential  # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: git credential fill
+    stdin: "protocol=https\nhost={{ item.1 }}\n{{ ('path=' ~ item.0.repo ~ '.git\n')
+      if item.0.repo is defined else '' }}\n"
+  environment:
+    GIT_TERMINAL_PROMPT: "0"
+  loop: >-
+    {{ sandbox_surrogates_surrogates.values() | selectattr('scheme', 'eq', 'basic') | subelements('target_hosts') }}
+  loop_control:
+    label: "{{ item.1 }}{{ ('/' ~ item.0.repo) if item.0.repo is defined else '' }}"
+  register: sandbox_surrogates_fill
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Assert git hands out the surrogate, and only the surrogate
+  ansible.builtin.assert:
+    that:
+      - item.stdout is search('(?m)^username=' ~ (item.item.0.credential.split(':', 1)[0] | regex_escape) ~ '$')
+      - item.stdout is search('(?m)^password=' ~ (item.item.0.credential.split(':', 1)[1] | regex_escape) ~ '$')
+    fail_msg: >-
+      git credential fill for {{ item.item.1 }} {{ item.item.0.repo | default('') }} did not return its surrogate
+    quiet: true
+  loop: "{{ sandbox_surrogates_fill.results }}"
+  loop_control:
+    label: "{{ item.item.1 }}"
+  when: not ansible_check_mode
+...

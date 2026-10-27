@@ -1,0 +1,11 @@
+---
+- name: Restart vault
+  ansible.builtin.systemd_service:
+    name: vault
+    state: restarted
+    daemon_reload: true
+  become: true
+  listen: vault_server restart
+  # A dry run writes no unit or config, so there is nothing to restart.
+  when: not ansible_check_mode
+...

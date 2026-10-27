@@ -1,0 +1,41 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries are asserted against their prerequisites rather than assumed.
+ruff_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+ruff_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS — not caller-settable.
+#
+# The user lane connects as guest_user, so the facts describe that account.
+# astral-sh names its assets by GNU triple, and the contract bracket admits
+# only the two architectures that map onto one.
+# ---------------------------------------------------------------------------
+ruff_home: "{{ ansible_facts['user_dir'] }}"
+ruff_bin_dir: "{{ ruff_home }}/.local/bin"
+ruff_platform: "{{ ansible_facts['architecture'] }}-unknown-linux-gnu"
+ruff_tarball: "ruff-{{ ruff_platform }}.tar.gz"
+ruff_download_url: "https://github.com/astral-sh/ruff/releases/download/{{ ruff_version }}/{{ ruff_tarball }}"
+ruff_install_root: "{{ ruff_home }}/.local/share/ruff-dist"
+ruff_install_dir: "{{ ruff_install_root }}/{{ ruff_version }}"
+ruff_version_pattern: "^ruff {{ ruff_version | regex_escape }}$"
+
+# SHA-256 digests pinned per version, per platform, from the .sha256 files
+# astral-sh publishes beside each asset. A pair absent here resolves to '' and
+# is caught by the checksum assert in tasks/main.yml.
+ruff_pinned_checksums:
+  "0.17.2":
+    aarch64-unknown-linux-gnu: "468f29d64949574f0d28442c02f0b4fb680cff7ba8fc26b6287a73b945308e1c"
+    x86_64-unknown-linux-gnu: "7b2e6a6e132ecf7b5fe726163b186d5d209befe93bb25f83767b2d97fbdf14e5"
+
+# An explicit ruff_checksum wins, otherwise the pinned value. The input and the
+# resolved value need separate names: set_fact cannot override a role param.
+ruff_effective_checksum: >-
+  {{ ruff_checksum if ruff_checksum | length > 0
+     else ruff_pinned_checksums.get(ruff_version, {}).get(ruff_platform, '') }}
+...

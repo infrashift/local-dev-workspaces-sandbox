@@ -1,0 +1,165 @@
+---
+# Example stack: a Python developer workstation on top of vm-baseline.yml.
+# Copy it and keep only the roles your stack needs -- every role is optional,
+# and none of them has defaults, so each entry below states every parameter.
+#
+#   make -f lab-provision.mk play PLAYBOOK=python-stack   (dry run, then "yes")
+#
+# Two lanes, as in the trusted-devcontainer runner the roles came from:
+#   system  connects as admin and becomes root: packages, /etc, systemd.
+#   user    connects AS guest_user (dev), no become: everything under its home,
+#           owned correctly by construction.
+# Every role asserts it was applied in the right lane. Both lanes run with the
+# gateway's proxy environment: the sandbox has no other way out.
+- name: Baseline
+  ansible.builtin.import_playbook: vm-baseline.yml
+
+- name: Python stack, system lane (root)
+  hosts: dev_ws
+  become: true
+  gather_facts: true
+  environment: "{{ sandbox_proxy_env }}"
+
+  vars_files:
+    - ../vars/gateway.yml
+
+  roles:
+    - role: podman
+      podman_mode: rootless
+      podman_rootless_user: "{{ guest_user }}"
+
+    - role: tmux
+      tmux_session_name: dev
+      tmux_editor_pane_command: nvim
+      tmux_shell_pane_percent: "35"
+      # Start the editor | shell layout on interactive ssh logins only.
+      tmux_autostart: ssh
+
+    # gcc, git, ripgrep, fd for the lazyvim role below.
+    - role: lazyvim_system
+
+- name: Python stack, user lane (guest_user)
+  hosts: dev_ws
+  gather_facts: true
+  environment: "{{ sandbox_proxy_env }}"
+
+  vars_files:
+    - ../vars/gateway.yml
+    - ../vars/github-mcp.yml
+
+  vars:
+    # Connect as the account being provisioned, with its own key, instead of
+    # group_vars' admin.
+    ansible_user: "{{ guest_user }}"
+    ansible_ssh_private_key_file: "{{ guest_user_ssh_key }}"
+    # Fedora 44's system python3; the uv-installed tools run on it (uv is told
+    # never to download an interpreter).
+    stack_python_version: "3.14"
+    # Per repository <key> in github_repos:
+    #   github-local-<key>     on this guest, over stdio, with its api surrogate
+    #                          (api.github.com and raw.githubusercontent.com)
+    #   github-upstream-<key>  the self-hosted remote server on upstream-1
+    #   github-hosted-<key>    GitHub's hosted remote server
+    # both remote ones with its mcp surrogate.
+    github_mcp_servers: >-
+      {%- set servers = {} -%}
+      {%- for key, spec in github_repos.items() -%}
+      {%-   set bound = surrogates.values() | selectattr('repo', 'defined') | selectattr('repo', 'eq', spec.repo) -%}
+      {%-   set api = bound | selectattr('use', 'eq', 'api') | first -%}
+      {%-   set mcp = bound | selectattr('use', 'eq', 'mcp') | first -%}
+      {%-   set _ = servers.update({
+              'github-local-' ~ key: {
+                'type': 'stdio',
+                'command': ansible_facts['user_dir'] ~ '/.local/bin/github-mcp-server',
+                'args': ['stdio'] + (['--read-only'] if github_mcp_read_only else []),
+                'env': {'GITHUB_PERSONAL_ACCESS_TOKEN': api.credential}},
+              'github-upstream-' ~ key: {
+                'type': 'http',
+                'url': 'https://' ~ (gateway_routes | selectattr('upstream.ca', 'eq', 'upstream') | first).host ~ '/',
+                'headers': {'Authorization': 'Bearer ' ~ mcp.credential}},
+              'github-hosted-' ~ key: {
+                'type': 'http',
+                'url': github_mcp_hosted_url,
+                'headers': {'Authorization': 'Bearer ' ~ mcp.credential}}}) -%}
+      {%- endfor -%}
+      {{ servers }}
+
+  # Order matters where a role needs another's binary: uv before the uv-tool
+  # roles, neovim before lazyvim.
+  roles:
+    # Proxy settings for the toolchains that ignore HTTPS_PROXY, and the
+    # sandbox's surrogate credentials (git's credential store).
+    - role: sandbox_user_egress
+      sandbox_user_egress_gateway_ip: "{{ gateway_ip }}"
+      sandbox_user_egress_proxy_port: "{{ proxy_port }}"
+      sandbox_user_egress_gateway_hosts: "{{ gateway_routes | map(attribute='host') | list }}"
+
+    - role: sandbox_surrogates
+      sandbox_surrogates_surrogates: "{{ surrogates }}"
+
+    - role: uv
+      uv_version: "0.13.5"
+      uv_checksum: ""
+
+    - role: ruff
+      ruff_version: "0.17.2"
+      ruff_checksum: ""
+
+    - role: jq
+      jq_version: "1.8.2"
+      jq_checksum: ""
+
+    - role: grype
+      grype_version: "0.117.0"
+      grype_checksum: ""
+
+    - role: syft
+      syft_version: "1.51.0"
+      syft_checksum: ""
+
+    # The local GitHub MCP server, for Claude Code below.
+    - role: github_mcp_server
+      github_mcp_server_version: "{{ github_mcp_version }}"
+      github_mcp_server_checksum: "{{ github_mcp_sha256 }}"
+
+    # X.Y.Z pins the release and turns its auto-updater off; stable or latest
+    # tracks that channel instead.
+    - role: claude_code
+      claude_code_version: "2.1.308"
+      # Scenario 5: Claude Code holds the SURROGATE key; the gateway injects
+      # the real one for api.anthropic.com. No non-essential traffic (it would
+      # need hosts outside the allow list).
+      claude_code_environment:
+        ANTHROPIC_API_KEY: "{{ surrogates.anthropic.credential }}"
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      # Scenario 3: the GitHub MCP servers, three per repository (github_repos),
+      # each holding that repository's SURROGATE token, which the gateway swaps
+      # for its own fine-grained PAT (concepts/GitHub MCP Servers Behind the
+      # Gateway).
+      claude_code_mcp_servers: "{{ github_mcp_servers }}"
+
+    - role: neovim
+      neovim_version: "0.12.5"
+      neovim_checksum: ""
+
+    - role: pyrefly
+      pyrefly_version: "1.3.1"
+      pyrefly_python_version: "{{ stack_python_version }}"
+
+    - role: python_tools
+      python_tools_basedpyright_version: "1.40.1"
+      python_tools_python_version: "{{ stack_python_version }}"
+
+    - role: ansible_tools
+      ansible_tools_ansible_lint_version: "26.10.1"
+      ansible_tools_python_version: "{{ stack_python_version }}"
+
+    - role: lazyvim
+      lazyvim_extras: lang.python,infrashift.ansible_lint
+      lazyvim_python_lsp: pyrefly
+      lazyvim_tree_sitter_version: "0.27.0"
+      lazyvim_tree_sitter_checksum: ""
+      lazyvim_stylua_version: "2.5.2"
+      lazyvim_stylua_checksum: ""
+      lazyvim_shfmt_version: "3.14.1"
+      lazyvim_shfmt_checksum: ""

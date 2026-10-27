@@ -1,0 +1,21 @@
+---
+galaxy_info:
+  author: infrashift
+  description: >-
+    The gateway CA and Envoy's TLS-gateway certificate, plus the lab's upstream-test CA, on the Linux
+    x86_64 host
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - pki
+    - tls
+    - envoy
+    - linux
+
+dependencies: []
+...

@@ -1,0 +1,206 @@
+---
+# Grype from the anchore release tarball, verified against the release's
+# checksums file, into ~/.local/share/grype/<version>, linked into
+# ~/.local/bin.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - grype_variant in grype_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      grype supports {{ grype_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ grype_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Assert that the play names the account it provisions
+  ansible.builtin.assert:
+    that: guest_user is defined and guest_user is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: "Set guest_user (the account this user-lane role installs for) at the play level."
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: grype_whoami
+  changed_when: false
+  check_mode: false
+
+# Everything lands in this account's home, so it must be the account running
+# the role -- files are then owned correctly by construction, with no become,
+# owner/group or chown. Facts must come from the same account: the home
+# directory is read from them.
+- name: Assert that the role runs in the user lane, as guest_user
+  ansible.builtin.assert:
+    that:
+      - grype_whoami.stdout == guest_user
+      - ansible_facts['user_id'] == guest_user
+    fail_msg: >-
+      grype installs into {{ guest_user }}'s home and must run as that account: apply
+      it from a play that connects as guest_user without become (it ran as
+      {{ grype_whoami.stdout }}; facts were gathered as {{ ansible_facts['user_id'] }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+#
+#   pass-through  grype_checksum: must be DEFINED, may be empty -- empty means
+#                 "resolve from the release's checksums file".
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - grype_version is defined and grype_version is match('^\d+\.\d+\.\d+$')
+      - grype_checksum is defined
+      - grype_checksum | length == 0 or grype_checksum is match('^[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        grype_version   X.Y.Z, without the leading v
+        grype_checksum  '' to resolve from {{ grype_checksums_file }}, or the
+                         64-hex SHA-256 of {{ grype_tarball }}
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "grype {{ grype_version }} ({{ grype_arch }})"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Check the installed grype version
+  ansible.builtin.command: "{{ grype_bin_dir }}/grype version"
+  register: grype_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# `grype version` prints a "Version:   X.Y.Z" line; match that whole line.
+- name: Decide whether to install grype {{ grype_version }}
+  ansible.builtin.set_fact:
+    grype_install_required: >-
+      {{ grype_installed.rc != 0 or grype_installed.stdout is not search(grype_version_pattern) }}
+
+- name: Would download, SHA-256 verify and install grype {{ grype_version }}
+  ansible.builtin.debug:
+    msg: "{{ grype_download_url }} -> {{ grype_install_dir }}"
+  changed_when: true
+  when: grype_install_required and ansible_check_mode
+
+- name: Install grype {{ grype_version }}
+  when: grype_install_required and not ansible_check_mode
+  block:
+    - name: Create a scratch directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -grype
+      register: grype_tmp
+
+    # The checksums file cannot verify itself; it is fetched over TLS from the
+    # same release as the tarball.
+    - name: Download the grype checksums file
+      ansible.builtin.get_url:
+        url: "{{ grype_checksums_download_url }}"
+        dest: "{{ grype_tmp.path }}/{{ grype_checksums_file }}"
+        mode: "0644"
+        timeout: 60
+      when: grype_checksum | length == 0
+
+    - name: Read the grype checksums file
+      ansible.builtin.slurp:
+        src: "{{ grype_tmp.path }}/{{ grype_checksums_file }}"
+      register: grype_checksums
+      when: grype_checksum | length == 0
+
+    - name: Resolve the SHA-256 for {{ grype_tarball }}
+      ansible.builtin.set_fact:
+        grype_effective_checksum: >-
+          {{ grype_checksum if grype_checksum | length > 0
+             else (grype_checksums.content | b64decode
+                   | regex_search('(?m)^([0-9a-f]{64})\s+\*?' ~ (grype_tarball | regex_escape) ~ '$', '\1')
+                   | default([''], true) | first) }}
+
+    # A resolved-empty checksum means get_url would SKIP verification, not fail it.
+    - name: "Assert that a checksum is available: grype {{ grype_version }}"
+      ansible.builtin.assert:
+        that: grype_effective_checksum is match('^[0-9a-fA-F]{64}$')
+        fail_msg: >-
+          No SHA-256 resolved for {{ grype_tarball }}: it is not listed in
+          {{ grype_checksums_file }}, and no grype_checksum was supplied.
+        quiet: true
+
+    - name: Download the grype tarball (verified against the SHA-256)
+      ansible.builtin.get_url:
+        url: "{{ grype_download_url }}"
+        dest: "{{ grype_tmp.path }}/{{ grype_tarball }}"
+        checksum: "sha256:{{ grype_effective_checksum }}"
+        mode: "0644"
+        timeout: 120
+
+    - name: Remove any previously installed grype
+      ansible.builtin.file:
+        path: "{{ grype_install_root }}"
+        state: absent
+
+    - name: Create the grype install directory
+      ansible.builtin.file:
+        path: "{{ grype_install_dir }}"
+        state: directory
+        mode: "0755"
+
+    # The tarball also carries the licence and README; only the binary is kept.
+    - name: Extract the grype binary
+      ansible.builtin.unarchive:
+        src: "{{ grype_tmp.path }}/{{ grype_tarball }}"
+        dest: "{{ grype_install_dir }}"
+        remote_src: true
+        include: [grype]
+
+  always:
+    - name: Remove the scratch directory
+      ansible.builtin.file:
+        path: "{{ grype_tmp.path }}"
+        state: absent
+      when: grype_tmp.path is defined
+
+- name: Ensure ~/.local/bin exists
+  ansible.builtin.file:
+    path: "{{ grype_bin_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Link grype into ~/.local/bin
+  ansible.builtin.file:
+    src: "{{ grype_install_dir }}/grype"
+    dest: "{{ grype_bin_dir }}/grype"
+    state: link
+    force: true
+  when: not (ansible_check_mode and grype_install_required)
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the REQUESTED version. Skipped only in a dry run that would
+# install.
+# ---------------------------------------------------------------------------
+- name: Verify the installed grype version
+  ansible.builtin.command: "{{ grype_bin_dir }}/grype version"
+  register: grype_verify
+  changed_when: false
+  check_mode: false
+  when: not (ansible_check_mode and grype_install_required)
+
+- name: "Assert that the requested version is installed: grype {{ grype_version }}"
+  ansible.builtin.assert:
+    that: grype_verify.stdout is search(grype_version_pattern)
+    fail_msg: "Expected grype {{ grype_version }}; `grype version` reported: {{ grype_verify.stdout }}"
+    success_msg: "grype {{ grype_version }} installed and verified."
+  when: not (ansible_check_mode and grype_install_required)
+...

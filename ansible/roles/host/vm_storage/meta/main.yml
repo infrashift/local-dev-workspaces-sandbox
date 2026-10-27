@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  author: infrashift
+  description: VM image and libvirt pool directories for ai-sandbox on a Linux x86_64 host
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - storage
+    - qemu
+    - linux
+
+dependencies: []
+...

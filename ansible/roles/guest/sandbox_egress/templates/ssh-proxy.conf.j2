@@ -1,0 +1,6 @@
+# {{ ansible_managed }}
+# SSH leaves this sandbox only through the gateway's CONNECT tunnel, so it
+# reaches exactly the host:22 entries on the allow list. Authentication uses
+# the forwarded sandbox ssh-agent; no key lives here.
+Host * !localhost !127.0.0.1
+    ProxyCommand /usr/bin/ncat --proxy {{ sandbox_egress_gateway_ip }}:{{ sandbox_egress_proxy_port }} --proxy-type http %h %p

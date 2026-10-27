@@ -1,0 +1,25 @@
+---
+github_mcp_server_compatibility_list:
+  - fedora44
+github_mcp_server_variant: >-
+  {{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS — not caller-settable.
+#
+# goreleaser names the tarballs github-mcp-server_Linux_x86_64.tar.gz /
+# _Linux_arm64.tar.gz (uname's names); each holds the binary, LICENSE and
+# README.md.
+# ---------------------------------------------------------------------------
+github_mcp_server_home: "{{ ansible_facts['user_dir'] }}"
+github_mcp_server_bin_dir: "{{ github_mcp_server_home }}/.local/bin"
+github_mcp_server_archive: >-
+  github-mcp-server_Linux_{{ {'aarch64': 'arm64', 'x86_64': 'x86_64'}[ansible_facts['architecture']] }}.tar.gz
+github_mcp_server_download_url: >-
+  https://github.com/github/github-mcp-server/releases/download/v{{ github_mcp_server_version
+  }}/{{ github_mcp_server_archive }}
+github_mcp_server_install_root: "{{ github_mcp_server_home }}/.local/share/github-mcp-server"
+github_mcp_server_install_dir: "{{ github_mcp_server_install_root }}/{{ github_mcp_server_version }}"
+# `--version` prints "Version: 2.0.3" on its own line.
+github_mcp_server_version_line: "(?m)^Version: {{ github_mcp_server_version | regex_escape }}$"
+...

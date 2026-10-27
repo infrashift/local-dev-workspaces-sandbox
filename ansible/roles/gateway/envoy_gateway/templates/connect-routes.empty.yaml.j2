@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+# Placeholder until consul-template renders the allow list: refuse every
+# tunnel. consul-template replaces this file atomically; Envoy watches it.
+resources:
+  - "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+    name: connect_routes
+    virtual_hosts:
+      - name: deny
+        domains: ["*"]
+        routes:
+          - match: { connect_matcher: {} }
+            direct_response:
+              status: 403
+              body: { inline_string: "ai-sandbox egress: the allow list is not loaded yet\n" }

@@ -1,0 +1,254 @@
+---
+# One HashiCorp product (Terraform, Vault, Consul, consul-template, ...) from
+# releases.hashicorp.com, verified end to end, only if the pinned version is
+# not already installed:
+#   1. <product>_<version>_SHA256SUMS must carry a valid signature whose
+#      PRIMARY key is the pinned fingerprint (releases are signed by a subkey);
+#   2. the linux_<arch> zip must match the SHA-256 in that signed file.
+# The binary lands in hashicorp_release_dest only after every check passes.
+# A system-wide dest (/usr/local/bin) needs `become: true` on the role entry.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - hashicorp_release_product is defined and hashicorp_release_product is match('^[a-z][a-z0-9-]*$')
+      # Stable releases only: a prerelease (1.18.0-beta1) must be chosen on purpose, by editing this role.
+      - hashicorp_release_version is defined and hashicorp_release_version is match('^\d+\.\d+\.\d+$')
+      # The SHA256SUMS must be signed under exactly this primary key, not merely
+      # by some key in the downloaded keyring.
+      - hashicorp_release_key_fpr is defined and hashicorp_release_key_fpr is match('^[0-9A-Fa-f]{40}$')
+      - hashicorp_release_dest is defined and hashicorp_release_dest is match('^/[^ ]+$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        hashicorp_release_product          product name on releases.hashicorp.com (e.g. terraform)
+        hashicorp_release_version          X.Y.Z (stable releases only)
+        hashicorp_release_key_fpr          HashiCorp's 40-hex-digit primary key fingerprint, pinned
+                                           from https://www.hashicorp.com/security
+        hashicorp_release_dest             absolute install directory
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      {{ hashicorp_release_label }} -> {{ hashicorp_release_dest }} (signed by {{ hashicorp_release_key_fpr }})
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: "Check the installed version of {{ hashicorp_release_product }}"
+  ansible.builtin.command:
+    argv: "{{ hashicorp_release_version_argv }}"
+  environment: "{{ hashicorp_release_env }}"
+  register: hashicorp_release_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# `terraform version` prints "Terraform v1.17.0" on its first line, then the
+# platform and any upgrade notice.
+- name: "Decide whether to install {{ hashicorp_release_label }}"
+  ansible.builtin.set_fact:
+    hashicorp_release_needed: >-
+      {{ hashicorp_release_installed.rc != 0
+         or not ((hashicorp_release_installed.stdout_lines | first | default('', true))
+                 is search('(^|\s)v' ~ (hashicorp_release_version | regex_escape) ~ '(\s|$)')) }}
+
+- name: "Would download, GPG/SHA-256 verify and install {{ hashicorp_release_label }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ hashicorp_release_base_url }}/{{ hashicorp_release_zip }} -> {{ hashicorp_release_dest }}
+      (SHA256SUMS signed by {{ hashicorp_release_key_fpr }})
+  changed_when: true
+  when: hashicorp_release_needed and ansible_check_mode
+
+- name: "Install {{ hashicorp_release_label }}"
+  when: hashicorp_release_needed and not ansible_check_mode
+  block:
+    - name: Create a scratch directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: "-{{ hashicorp_release_product }}"
+      register: hashicorp_release_tmp
+
+    # None of these can verify itself; the signature check below covers the
+    # SHA256SUMS, and the pinned fingerprint covers the keyring.
+    - name: Download the SHA256SUMS, its signature and the HashiCorp keyring
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "{{ hashicorp_release_tmp.path }}/{{ item.name }}"
+        mode: "0644"
+      loop:
+        - { url: "{{ hashicorp_release_base_url }}/{{ hashicorp_release_sums }}", name: SHA256SUMS }
+        - { url: "{{ hashicorp_release_base_url }}/{{ hashicorp_release_sums }}.sig", name: SHA256SUMS.sig }
+        - { url: "{{ hashicorp_release_key_url }}", name: hashicorp.asc }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Create a throwaway GnuPG home (leaves ~/.gnupg alone)
+      ansible.builtin.file:
+        path: "{{ hashicorp_release_tmp.path }}/gnupg"
+        state: directory
+        mode: "0700"
+
+    - name: Dearmor the keyring for gpgv
+      ansible.builtin.command:
+        argv:
+          - "{{ hashicorp_release_gpg }}"
+          - --homedir={{ hashicorp_release_tmp.path }}/gnupg
+          - --batch
+          - --dearmor
+          - --output={{ hashicorp_release_tmp.path }}/hashicorp.gpg
+          - "{{ hashicorp_release_tmp.path }}/hashicorp.asc"
+        creates: "{{ hashicorp_release_tmp.path }}/hashicorp.gpg"
+
+    # --status-fd reports which key signed. VALIDSIG names the signing subkey
+    # first and the primary key last; the primary key is the one pinned.
+    - name: Verify the SHA256SUMS signature
+      ansible.builtin.command:
+        argv:
+          - "{{ hashicorp_release_gpgv }}"
+          - --status-fd=1
+          - --keyring={{ hashicorp_release_tmp.path }}/hashicorp.gpg
+          - "{{ hashicorp_release_tmp.path }}/SHA256SUMS.sig"
+          - "{{ hashicorp_release_tmp.path }}/SHA256SUMS"
+      register: hashicorp_release_gpgv_out
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the signature is valid and made under the pinned key
+      ansible.builtin.assert:
+        that:
+          - hashicorp_release_gpgv_out.rc == 0
+          - >-
+            hashicorp_release_gpgv_out.stdout is search('(?m)^\[GNUPG:\] VALIDSIG [0-9A-F]{40} .* '
+            ~ (hashicorp_release_key_fpr | upper) ~ '$')
+        fail_msg: >-
+          {{ hashicorp_release_sums }} is not validly signed under the pinned key {{ hashicorp_release_key_fpr }}
+          (gpgv rc={{ hashicorp_release_gpgv_out.rc }}): {{ hashicorp_release_gpgv_out.stdout }}
+          {{ hashicorp_release_gpgv_out.stderr }}
+        success_msg: "Good signature under {{ hashicorp_release_key_fpr }}"
+
+    - name: Read the signed SHA256SUMS
+      ansible.builtin.slurp:
+        src: "{{ hashicorp_release_tmp.path }}/SHA256SUMS"
+      register: hashicorp_release_signed
+
+    # Anchored to the whole file name, so no other asset's line can answer.
+    - name: "Extract the SHA-256 of {{ hashicorp_release_zip }}"
+      ansible.builtin.set_fact:
+        hashicorp_release_sha256: >-
+          {{ hashicorp_release_signed.content | b64decode
+             | regex_search('(?m)^([0-9a-f]{64})\s+\*?' ~ (hashicorp_release_zip | regex_escape) ~ '$', '\1')
+             | default([''], true) | first }}
+
+    # An empty digest would make get_url skip verification rather than fail it.
+    - name: Assert the signed SHA256SUMS lists the zip
+      ansible.builtin.assert:
+        that: hashicorp_release_sha256 is match('^[0-9a-f]{64}$')
+        fail_msg: "No SHA-256 for {{ hashicorp_release_zip }} in the signed {{ hashicorp_release_sums }}"
+        quiet: true
+
+    - name: "Download the zip, verified against the signed SHA-256: {{ hashicorp_release_zip }}"
+      ansible.builtin.get_url:
+        url: "{{ hashicorp_release_base_url }}/{{ hashicorp_release_zip }}"
+        dest: "{{ hashicorp_release_tmp.path }}/{{ hashicorp_release_zip }}"
+        checksum: "sha256:{{ hashicorp_release_sha256 }}"
+        mode: "0644"
+        timeout: 60
+
+    # The same unzip the unarchive module would drive, without its extra
+    # remote-side probing.
+    # check-mode: inside the install block; the "Would ..." task reports it.
+    - name: Unpack the zip  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        argv:
+          - "{{ hashicorp_release_unzip }}"
+          - -q
+          - -o
+          - "{{ hashicorp_release_zip }}"
+          - -d
+          - unpacked
+        chdir: "{{ hashicorp_release_tmp.path }}"
+      changed_when: true
+
+    - name: "Stat the unpacked binary: {{ hashicorp_release_product }}"
+      ansible.builtin.stat:
+        path: "{{ hashicorp_release_tmp.path }}/unpacked/{{ hashicorp_release_product }}"
+        get_checksum: false
+      register: hashicorp_release_unpacked
+
+    - name: "Assert that the zip holds {{ hashicorp_release_product }}"
+      ansible.builtin.assert:
+        that: hashicorp_release_unpacked.stat.exists and hashicorp_release_unpacked.stat.isreg
+        fail_msg: "{{ hashicorp_release_zip }} has no top-level {{ hashicorp_release_product }} binary"
+        quiet: true
+
+    - name: Ensure the destination directory exists
+      ansible.builtin.file:
+        path: "{{ hashicorp_release_dest }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Install into {{ hashicorp_release_dest }}"
+      ansible.builtin.copy:
+        src: "{{ hashicorp_release_tmp.path }}/unpacked/{{ hashicorp_release_product }}"
+        dest: "{{ hashicorp_release_dest }}/{{ hashicorp_release_product }}"
+        remote_src: true
+        mode: "0755"
+
+  always:
+    - name: Remove the scratch directory
+      ansible.builtin.file:
+        path: "{{ hashicorp_release_tmp.path }}"
+        state: absent
+      when: hashicorp_release_tmp.path is defined
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the REQUESTED version, not merely a binary that runs.
+# Skipped only in a dry run that would install.
+# ---------------------------------------------------------------------------
+- name: "Verify the installed version of {{ hashicorp_release_product }}"
+  ansible.builtin.command:
+    argv: "{{ hashicorp_release_version_argv }}"
+  environment: "{{ hashicorp_release_env }}"
+  register: hashicorp_release_verify
+  changed_when: false
+  check_mode: false
+  when: not (hashicorp_release_needed and ansible_check_mode)
+
+- name: "Assert that the requested version is installed: {{ hashicorp_release_label }}"
+  ansible.builtin.assert:
+    that: >-
+      (hashicorp_release_verify.stdout_lines | first | default('', true))
+      is search('(^|\s)v' ~ (hashicorp_release_version | regex_escape) ~ '(\s|$)')
+    fail_msg: >-
+      Expected {{ hashicorp_release_label }}; {{ hashicorp_release_product }} version said:
+      {{ hashicorp_release_verify.stdout }}
+    success_msg: "{{ hashicorp_release_verify.stdout_lines | first }}"
+  when: not (hashicorp_release_needed and ansible_check_mode)
+...

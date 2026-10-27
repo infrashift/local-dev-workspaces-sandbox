@@ -1,0 +1,45 @@
+---
+# Ensure one Vault API object holds the desired fields: read it, compare the
+# desired fields with what Vault returns, write only if they differ. A dry run
+# reports the write it would make.
+#   vault_gateway_object: { path, data, kv (bool), secret (bool) }
+- name: "Read {{ vault_gateway_object.path }}"
+  ansible.builtin.uri:
+    url: "{{ vault_gateway_url }}/v1/{{ vault_gateway_object.path }}"
+    unix_socket: "{{ vault_gateway_socket }}"
+    headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+    status_code: [200, 404]
+  register: vault_gateway_current
+  check_mode: false
+  no_log: "{{ vault_gateway_object.secret }}"
+
+- name: "Compare {{ vault_gateway_object.path }}"
+  ansible.builtin.set_fact:
+    vault_gateway_have: >-
+      {{ {} if vault_gateway_current.status == 404
+         else (vault_gateway_current.json.data.data if vault_gateway_object.kv else vault_gateway_current.json.data) }}
+  no_log: "{{ vault_gateway_object.secret }}"
+
+- name: "Would write {{ vault_gateway_object.path }}"
+  ansible.builtin.debug:
+    msg: "{{ vault_gateway_object.path }}: {{ (vault_gateway_object.data.keys() | list) | join(', ') }}"
+  changed_when: true
+  when:
+    - ansible_check_mode
+    - (vault_gateway_have | combine(vault_gateway_object.data)) != vault_gateway_have
+
+- name: "Write {{ vault_gateway_object.path }}"
+  ansible.builtin.uri:
+    url: "{{ vault_gateway_url }}/v1/{{ vault_gateway_object.path }}"
+    unix_socket: "{{ vault_gateway_socket }}"
+    method: POST
+    headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+    body_format: json
+    body: "{{ {'data': vault_gateway_object.data} if vault_gateway_object.kv else vault_gateway_object.data }}"
+    status_code: [200, 204]
+  changed_when: true
+  no_log: "{{ vault_gateway_object.secret }}"
+  when:
+    - not ansible_check_mode
+    - (vault_gateway_have | combine(vault_gateway_object.data)) != vault_gateway_have
+...

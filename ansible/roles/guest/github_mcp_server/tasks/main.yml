@@ -1,0 +1,163 @@
+---
+# The GitHub MCP server (github/github-mcp-server) from its release tarball,
+# verified against a pinned SHA-256, into
+# ~/.local/share/github-mcp-server/<version>/, linked into ~/.local/bin.
+# Claude Code runs it over stdio (the claude_code role registers it); it
+# reaches api.github.com and raw.githubusercontent.com through the TLS
+# gateway, which swaps its surrogate token for the real one
+# (concepts/GitHub MCP Servers Behind the Gateway).
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - github_mcp_server_variant in github_mcp_server_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      github_mcp_server supports {{ github_mcp_server_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ github_mcp_server_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Assert that the play names the account it provisions
+  ansible.builtin.assert:
+    that: guest_user is defined and guest_user is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: "Set guest_user (the account this user-lane role installs for) at the play level."
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: github_mcp_server_whoami
+  changed_when: false
+  check_mode: false
+
+- name: Assert that the role runs in the user lane, as guest_user
+  ansible.builtin.assert:
+    that:
+      - github_mcp_server_whoami.stdout == guest_user
+      - ansible_facts['user_id'] == guest_user
+    fail_msg: >-
+      github_mcp_server installs into {{ guest_user }}'s home and must run as that account: apply
+      it from a play that connects as guest_user without become (it ran as
+      {{ github_mcp_server_whoami.stdout }}; facts were gathered as {{ ansible_facts['user_id'] }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - github_mcp_server_version is defined and github_mcp_server_version is match('^\d+\.\d+\.\d+$')
+      - github_mcp_server_checksum is defined and github_mcp_server_checksum is match('^[0-9a-f]{64}$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        github_mcp_server_version   X.Y.Z (a github/github-mcp-server release, without the v)
+        github_mcp_server_checksum  the 64-hex SHA-256 of that release's {{ github_mcp_server_archive }}
+                                    (vars/github-mcp.yml)
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "github-mcp-server {{ github_mcp_server_version }} ({{ github_mcp_server_archive }})"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Check the installed github-mcp-server version
+  ansible.builtin.command: "{{ github_mcp_server_bin_dir }}/github-mcp-server --version"
+  register: github_mcp_server_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# `--version` prints "Version: 2.0.3" on its own line; anchor the whole line.
+- name: Decide whether to install github-mcp-server {{ github_mcp_server_version }}
+  ansible.builtin.set_fact:
+    github_mcp_server_install_required: >-
+      {{ github_mcp_server_installed.rc != 0
+         or github_mcp_server_installed.stdout is not search(github_mcp_server_version_line) }}
+
+- name: Would download, SHA-256 verify and install github-mcp-server {{ github_mcp_server_version }}
+  ansible.builtin.debug:
+    msg: "{{ github_mcp_server_download_url }} -> {{ github_mcp_server_install_dir }}/github-mcp-server"
+  changed_when: true
+  when: github_mcp_server_install_required and ansible_check_mode
+
+- name: Install github-mcp-server {{ github_mcp_server_version }}
+  when: github_mcp_server_install_required and not ansible_check_mode
+  block:
+    - name: Remove any previously installed github-mcp-server
+      ansible.builtin.file:
+        path: "{{ github_mcp_server_install_root }}"
+        state: absent
+
+    - name: Create the github-mcp-server install directory
+      ansible.builtin.file:
+        path: "{{ github_mcp_server_install_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download the release tarball (verified against the pinned SHA-256)
+      ansible.builtin.get_url:
+        url: "{{ github_mcp_server_download_url }}"
+        dest: "{{ github_mcp_server_install_dir }}/{{ github_mcp_server_archive }}"
+        checksum: "sha256:{{ github_mcp_server_checksum }}"
+        mode: "0644"
+        timeout: 120
+
+    - name: Unpack the binary
+      ansible.builtin.unarchive:
+        src: "{{ github_mcp_server_install_dir }}/{{ github_mcp_server_archive }}"
+        dest: "{{ github_mcp_server_install_dir }}"
+        remote_src: true
+        include: [github-mcp-server]
+
+    - name: Remove the tarball
+      ansible.builtin.file:
+        path: "{{ github_mcp_server_install_dir }}/{{ github_mcp_server_archive }}"
+        state: absent
+
+- name: Ensure ~/.local/bin exists
+  ansible.builtin.file:
+    path: "{{ github_mcp_server_bin_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Link github-mcp-server into ~/.local/bin
+  ansible.builtin.file:
+    src: "{{ github_mcp_server_install_dir }}/github-mcp-server"
+    dest: "{{ github_mcp_server_bin_dir }}/github-mcp-server"
+    state: link
+    force: true
+  when: not (ansible_check_mode and github_mcp_server_install_required)
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the REQUESTED version. Skipped only in a dry run that would
+# install.
+# ---------------------------------------------------------------------------
+- name: Verify the installed github-mcp-server version
+  ansible.builtin.command: "{{ github_mcp_server_bin_dir }}/github-mcp-server --version"
+  register: github_mcp_server_verify
+  changed_when: false
+  check_mode: false
+  when: not (ansible_check_mode and github_mcp_server_install_required)
+
+- name: "Assert that the requested version is installed: github-mcp-server {{ github_mcp_server_version }}"
+  ansible.builtin.assert:
+    that: github_mcp_server_verify.stdout is search(github_mcp_server_version_line)
+    fail_msg: >-
+      Expected github-mcp-server {{ github_mcp_server_version }}; --version reported:
+      {{ github_mcp_server_verify.stdout }}
+    success_msg: "github-mcp-server {{ github_mcp_server_version }}"
+  when: not (ansible_check_mode and github_mcp_server_install_required)
+...

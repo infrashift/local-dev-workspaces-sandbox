@@ -1,0 +1,24 @@
+---
+# Ported from: trusted-devcontainer-templates features/src/lazyvim/ansible-role-system @ 15f68d3
+galaxy_info:
+  author: infrashift
+  description: System packages LazyVim needs (gcc, git, ripgrep, fd) on Fedora and EL guests
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Fedora
+      versions:
+        - "44"
+    - name: EL
+      versions:
+        - "9"
+        - "10"
+  galaxy_tags:
+    - neovim
+    - lazyvim
+    - fedora
+    - rhel
+
+dependencies: []
+...

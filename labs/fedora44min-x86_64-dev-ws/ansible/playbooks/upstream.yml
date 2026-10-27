@@ -1,0 +1,55 @@
+---
+# The trusted test fixtures on upstream-1, which the gateway reaches and the
+# sandbox cannot (the NAT network):
+#   the self-hosted remote GitHub MCP server (scenario 3), which takes the
+#   token the gateway injects and calls GitHub with it;
+#   the SCP target (scenario 4), which trusts only Vault's SSH CA, read from
+#   Vault on this host (the controller).
+#
+#   make -f lab-provision.mk play PLAYBOOK=upstream    (site.yml runs it too)
+- name: The upstream fixtures
+  hosts: upstream
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - ../vars/gateway.yml
+    - ../vars/github-mcp.yml
+
+  vars:
+    # gateway-host.yml's vault_socket: Vault's API is a unix socket only, and the
+    # operator opens it by ACL.
+    vault_socket: /run/vault/vault.sock
+    mcp_route: "{{ gateway_routes | selectattr('upstream.ca', 'eq', 'upstream') | first }}"
+
+  pre_tasks:
+    - name: Assert the lab values were passed
+      ansible.builtin.assert:
+        that: project_root is defined
+        fail_msg: "Pass lab-config.mk's lab values (--extra-vars '<LAB_VARS>')."
+        quiet: true
+      tags: [always]
+
+    - name: Read the Vault SSH CA's public key
+      ansible.builtin.uri:
+        url: http://localhost/v1/ssh-sandbox/public_key
+        unix_socket: "{{ vault_socket }}"
+        return_content: true
+      delegate_to: localhost
+      become: false
+      register: upstream_ssh_ca
+      check_mode: false
+
+  roles:
+    - role: upstream_github_mcp
+      upstream_github_mcp_version: "{{ github_mcp_version }}"
+      upstream_github_mcp_checksum: "{{ github_mcp_sha256 }}"
+      upstream_github_mcp_port: "{{ mcp_route.upstream.port }}"
+      upstream_github_mcp_cert_src: "{{ project_root }}/.pki/upstream/mcp.pem"
+      upstream_github_mcp_key_src: "{{ project_root }}/.pki/upstream/mcp.key"
+      upstream_github_mcp_read_only: "{{ github_mcp_read_only }}"
+
+    - role: upstream_ssh_target
+      upstream_ssh_target_user: "{{ scp_target_user }}"
+      upstream_ssh_target_ca_key: "{{ upstream_ssh_ca.content }}"
+...

@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  author: infrashift
+  description: Proxy settings for the dev toolchains that ignore HTTPS_PROXY (Maven, Gradle, Java, npm, cargo)
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Fedora
+      versions:
+        - "44"
+  galaxy_tags:
+    - proxy
+    - sandbox
+    - fedora
+
+dependencies: []
+...

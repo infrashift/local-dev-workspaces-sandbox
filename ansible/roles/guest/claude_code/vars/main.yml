@@ -1,0 +1,31 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries are asserted against their prerequisites rather than assumed.
+claude_code_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+claude_code_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS — not caller-settable.
+#
+# Release layout, as https://claude.ai/install.sh reads it:
+#   <base>/stable | <base>/latest                       the channel's version
+#   <base>/<version>/manifest.json                      platforms.<platform>.checksum
+#   <base>/<version>/<platform>/claude                  the binary
+# Fedora and EL are glibc, so the -musl platforms never apply.
+# ---------------------------------------------------------------------------
+claude_code_home: "{{ ansible_facts['user_dir'] }}"
+claude_code_bin_dir: "{{ claude_code_home }}/.local/bin"
+claude_code_base_url: https://downloads.claude.ai/claude-code-releases
+claude_code_platform: "linux-{{ {'aarch64': 'arm64', 'x86_64': 'x64'}[ansible_facts['architecture']] }}"
+claude_code_pinned: "{{ claude_code_version is match('^\\d+\\.\\d+\\.\\d+$') }}"
+claude_code_versions_dir: "{{ claude_code_home }}/.local/share/claude/versions"
+claude_code_binary: "{{ claude_code_versions_dir }}/{{ claude_code_target }}"
+claude_code_env_file: "{{ claude_code_home }}/.bashrc.d/claude-code.sh"
+# User-scope settings and MCP servers (and Claude Code's own state).
+claude_code_config: "{{ claude_code_home }}/.claude.json"
+...

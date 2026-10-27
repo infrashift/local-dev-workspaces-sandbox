@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  author: infrashift
+  description: The host firewall that leaves the sandbox network only Envoy's two listeners, on the Linux x86_64 host
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - nftables
+    - firewall
+    - linux
+
+dependencies: []
+...

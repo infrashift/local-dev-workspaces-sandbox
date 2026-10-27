@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  author: infrashift
+  description: The sandbox's surrogate credentials for the dev user (git credential store, environment)
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Fedora
+      versions:
+        - "44"
+  galaxy_tags:
+    - credentials
+    - sandbox
+    - fedora
+
+dependencies: []
+...

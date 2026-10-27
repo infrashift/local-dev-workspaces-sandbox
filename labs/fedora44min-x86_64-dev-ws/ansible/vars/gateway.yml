@@ -1,0 +1,174 @@
+---
+# The zero-trust gateway's routes and surrogates: the single source for the
+# gateway playbook (Envoy's TLS gateway, Vault's surrogate records, the
+# gateway certificate's SANs), the guest playbooks (/etc/hosts, NO_PROXY, the
+# guest's surrogate credentials) and the tests.
+#
+# Every host here is reached by the sandbox ONLY through Envoy's TLS gateway
+# (GATEWAY_IP:GATEWAY_PORT): the guest maps it to the gateway in /etc/hosts,
+# and the CONNECT tunnel refuses it even if an allow-list entry names it.
+# See concepts/Surrogate Credential Model.
+
+# host:       the name the guest uses (Host / :authority, and the cert SAN)
+# anonymous:  pass requests that carry no credential through unchanged
+#             (github.com: release downloads, public clones); otherwise 401
+# repo_path:  optional Lua pattern capturing owner and repository from the
+#             request path; a surrogate bound to a repository (repo:) is
+#             refused on another repository's path here (403). Paths it does
+#             not match (api.github.com/user, /graphql) pass: the fine-grained
+#             PAT behind the surrogate limits them itself.
+# upstream:   where Envoy sends the request, the SNI and name it verifies on
+#             the upstream certificate, and the CA it verifies with
+#             (system: the host's public bundle, plus the TLS-inspection
+#             chain when there is one; upstream: the lab's upstream-test CA);
+#             optionally the Host header Envoy sends instead (host_rewrite)
+gateway_routes:
+  - host: github.com
+    anonymous: true
+    repo_path: "^/([^/]+)/([^/?#]+)"
+    upstream: { address: github.com, port: 443, sni: github.com, ca: system }
+  # Repository archives (nvim-treesitter's parser downloads, go modules, the
+  # API's tarball redirects). Every subdomain of a gateway host must be one
+  # too: NO_PROXY names github.com, and curl, Python and Go match NO_PROXY
+  # entries as domain suffixes, so a client never sends codeload.github.com
+  # through the tunnel; it goes direct and fails (the sandbox has no DNS).
+  - host: codeload.github.com
+    anonymous: true
+    repo_path: "^/([^/]+)/([^/?#]+)/"
+    upstream: { address: codeload.github.com, port: 443, sni: codeload.github.com, ca: system }
+  - host: api.github.com
+    anonymous: true
+    repo_path: "^/repos/([^/]+)/([^/?#]+)"
+    upstream: { address: api.github.com, port: 443, sni: api.github.com, ca: system }
+  # File contents: the GitHub MCP server reads them here, with its token, so
+  # a private repository's files need the injected credential too.
+  - host: raw.githubusercontent.com
+    anonymous: true
+    repo_path: "^/([^/]+)/([^/?#]+)/"
+    upstream: { address: raw.githubusercontent.com, port: 443, sni: raw.githubusercontent.com, ca: system }
+  - host: api.anthropic.com
+    anonymous: false
+    upstream: { address: api.anthropic.com, port: 443, sni: api.anthropic.com, ca: system }
+  # GitHub's hosted remote MCP server (concepts/GitHub MCP Servers Behind the
+  # Gateway).
+  - host: api.githubcopilot.com
+    anonymous: false
+    upstream: { address: api.githubcopilot.com, port: 443, sni: api.githubcopilot.com, ca: system }
+  # The self-hosted remote GitHub MCP server on upstream-1 (its address is
+  # terraform.tfvars's; tests/guest/sandbox checks the two agree).
+  - host: mcp.upstream.ai-sandbox.test
+    anonymous: false
+    # host_rewrite: the MCP Go SDK's DNS-rebinding protection refuses a
+    # non-localhost Host on a loopback listener, which is where the server
+    # sits behind stunnel (403 "invalid Host header").
+    upstream:
+      { address: 192.168.151.10, port: 8443, sni: mcp.upstream.ai-sandbox.test, ca: upstream, host_rewrite: localhost }
+
+# The private GitHub repositories the sandbox may use. Each has its OWN
+# fine-grained PAT, limited to that one repository: the key is the PAT's
+# secret name in the host inventory (inventory-host/host_vars/localhost/
+# vars.yml gateway_secrets, encrypted in vault.yml; make -f lab-gateway.mk
+# secrets NAME=<key>). To add a repository: an entry here, its three
+# surrogates below, and its secret.
+github_repos:
+  private-scratch-1: { repo: infrashift/private-scratch-1 }
+  private-scratch-2: { repo: infrashift/private-scratch-2 }
+  private-scratch-3: { repo: infrashift/private-scratch-3 }
+
+# Surrogates: NON-secret credentials the guest holds. Each is bound to the
+# hosts it may be presented to, and a GitHub one to its repository; Envoy
+# swaps it for the real credential Vault holds under its lookup id (base64url
+# of `credential`, without padding).
+#   credential:   what the guest sends (basic: "user:password"; bearer and
+#                 x-api-key: the token)
+#   scheme:       basic | bearer | x-api-key, which is also what Envoy injects:
+#                 basic: Authorization: Basic base64(login:PAT), the login
+#                 read from GitHub with the PAT when the gateway is applied
+#                 bearer: Authorization: Bearer <token>
+#                 x-api-key: x-api-key: <key>
+#   use:          git (~/.git-credentials, per repository path), api (the REST
+#                 and GraphQL API and raw files as a token: the local GitHub
+#                 MCP server, gh), mcp (the remote GitHub MCP servers, which
+#                 call GitHub with the PAT themselves), anthropic
+#   target_hosts: gateway_routes hosts this surrogate is valid for (anti-replay)
+#   repo:         the one repository a GitHub surrogate is valid for
+#   secret:       the real credential behind it: a github_repos key (that
+#                 repository's PAT) or anthropic (the API key)
+surrogates:
+  github_git_scratch_1:
+    credential: "claude:surrogate-github-git-scratch-1"
+    scheme: basic
+    use: git
+    target_hosts: [github.com, api.github.com]
+    repo: infrashift/private-scratch-1
+    secret: private-scratch-1
+  github_api_scratch_1:
+    credential: "surrogate-github-api-scratch-1"
+    scheme: bearer
+    use: api
+    target_hosts: [api.github.com, raw.githubusercontent.com]
+    repo: infrashift/private-scratch-1
+    secret: private-scratch-1
+  github_mcp_scratch_1:
+    credential: "surrogate-github-mcp-scratch-1"
+    scheme: bearer
+    use: mcp
+    target_hosts: [mcp.upstream.ai-sandbox.test, api.githubcopilot.com]
+    repo: infrashift/private-scratch-1
+    secret: private-scratch-1
+
+  github_git_scratch_2:
+    credential: "claude:surrogate-github-git-scratch-2"
+    scheme: basic
+    use: git
+    target_hosts: [github.com, api.github.com]
+    repo: infrashift/private-scratch-2
+    secret: private-scratch-2
+  github_api_scratch_2:
+    credential: "surrogate-github-api-scratch-2"
+    scheme: bearer
+    use: api
+    target_hosts: [api.github.com, raw.githubusercontent.com]
+    repo: infrashift/private-scratch-2
+    secret: private-scratch-2
+  github_mcp_scratch_2:
+    credential: "surrogate-github-mcp-scratch-2"
+    scheme: bearer
+    use: mcp
+    target_hosts: [mcp.upstream.ai-sandbox.test, api.githubcopilot.com]
+    repo: infrashift/private-scratch-2
+    secret: private-scratch-2
+
+  github_git_scratch_3:
+    credential: "claude:surrogate-github-git-scratch-3"
+    scheme: basic
+    use: git
+    target_hosts: [github.com, api.github.com]
+    repo: infrashift/private-scratch-3
+    secret: private-scratch-3
+  github_api_scratch_3:
+    credential: "surrogate-github-api-scratch-3"
+    scheme: bearer
+    use: api
+    target_hosts: [api.github.com, raw.githubusercontent.com]
+    repo: infrashift/private-scratch-3
+    secret: private-scratch-3
+  github_mcp_scratch_3:
+    credential: "surrogate-github-mcp-scratch-3"
+    scheme: bearer
+    use: mcp
+    target_hosts: [mcp.upstream.ai-sandbox.test, api.githubcopilot.com]
+    repo: infrashift/private-scratch-3
+    secret: private-scratch-3
+
+  anthropic:
+    credential: "sk-ant-surrogate-claude-code"
+    scheme: x-api-key
+    use: anthropic
+    target_hosts: [api.anthropic.com]
+    secret: anthropic
+
+# The SCP target's account (scenario 4) and the principal the Vault SSH CA
+# signs the sandbox agent's certificate for.
+scp_target_user: scp-target
+...

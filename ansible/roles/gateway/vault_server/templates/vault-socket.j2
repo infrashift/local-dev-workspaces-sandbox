@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# vault-socket <socket> <group> [operator...]: give Vault's API socket to its
+# group (0660) and, by ACL, to the operators. Run as root by vault.service's
+# ExecStartPost, once Vault reports ready: the Vault server's unix listener
+# ignores socket_mode and socket_group (only Vault Agent and Proxy honour
+# them), so it creates the socket vault:vault and owner-only.
+set -euo pipefail
+SOCK="$1"
+GROUP="$2"
+shift 2
+for _ in $(seq 50); do
+  [ -S "$SOCK" ] && break
+  sleep 0.1
+done
+[ -S "$SOCK" ] || { echo "vault-socket: $SOCK did not appear" >&2; exit 1; }
+chgrp "$GROUP" "$SOCK"
+chmod 0660 "$SOCK"
+for user in "$@"; do
+  # A unix socket needs write to connect.
+  setfacl -m "u:$user:rw" "$SOCK"
+done

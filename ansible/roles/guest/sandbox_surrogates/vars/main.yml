@@ -1,0 +1,26 @@
+---
+sandbox_surrogates_compatibility_list:
+  - fedora44
+sandbox_surrogates_variant: >-
+  {{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS — not caller-settable.
+# ---------------------------------------------------------------------------
+sandbox_surrogates_home: "{{ ansible_facts['user_dir'] }}"
+# Read only for git: the helper below answers `get` from this file and
+# ignores `store` and `erase`. git's own credential-store erases an entry on
+# any 401, which would delete a surrogate for good after one upstream refusal
+# (an expired PAT, a gateway fault).
+sandbox_surrogates_git_credentials: "{{ sandbox_surrogates_home }}/.config/ai-sandbox/git-surrogates"
+sandbox_surrogates_git_helper: >-
+  !f() { if [ "$1" = get ]; then git credential-store --file={{ sandbox_surrogates_git_credentials }} get; fi; }; f
+# Where the role kept them before (credential-store's default file).
+sandbox_surrogates_former_git_credentials: "{{ sandbox_surrogates_home }}/.git-credentials"
+sandbox_surrogates_env_file: "{{ sandbox_surrogates_home }}/.bashrc.d/ai-sandbox-surrogates.sh"
+# Hosts where git must match the path: those a repository-bound Basic
+# surrogate is presented to.
+sandbox_surrogates_path_hosts: >-
+  {{ sandbox_surrogates_surrogates.values() | selectattr('scheme', 'eq', 'basic') | selectattr('repo', 'defined')
+     | map(attribute='target_hosts') | flatten | unique | sort }}
+...

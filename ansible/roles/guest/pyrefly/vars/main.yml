@@ -1,0 +1,38 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries are asserted against their prerequisites rather than assumed.
+pyrefly_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+pyrefly_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS — not caller-settable.
+# ---------------------------------------------------------------------------
+pyrefly_home: "{{ ansible_facts['user_dir'] }}"
+# The uv role's install; this role asserts it is there rather than looking
+# for any uv on PATH.
+pyrefly_uv: "{{ pyrefly_home }}/.local/bin/uv"
+pyrefly_bin: "{{ pyrefly_home }}/.local/bin/pyrefly"
+pyrefly_ansi_pattern: '\x1b\[[0-9;]*m'
+pyrefly_version_pattern: "(?m)^pyrefly {{ pyrefly_version | regex_escape }}(\\s|$)"
+
+# uv's own defaults, stated: tools under ~/.local/share/uv/tools, entry points
+# in ~/.local/bin. UV_PYTHON_DOWNLOADS=never makes a missing interpreter an
+# error instead of an unpinned download. SSL_CERT_FILE: uv ships its own root
+# certificates, so without it uv would not trust a TLS-intercepting proxy's CA
+# that ca_trust installed in the system bundle.
+pyrefly_env:
+  HOME: "{{ pyrefly_home }}"
+  PATH: "{{ pyrefly_home }}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+  UV_TOOL_DIR: "{{ pyrefly_home }}/.local/share/uv/tools"
+  UV_TOOL_BIN_DIR: "{{ pyrefly_home }}/.local/bin"
+  UV_PYTHON_DOWNLOADS: never
+  SSL_CERT_FILE: /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+  # ansible-lint colours --version even without a terminal; ANSI escapes
+  # would break the version match (also stripped below, as a defence).
+  NO_COLOR: "1"
+...

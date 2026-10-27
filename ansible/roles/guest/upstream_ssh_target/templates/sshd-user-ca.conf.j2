@@ -1,0 +1,7 @@
+# {{ ansible_managed }}
+# Trust user certificates from the lab's Vault SSH CA, for the principals in
+# {{ upstream_ssh_target_principals_dir }}/<user> only. Keys in authorized_keys
+# still work for the accounts that have them (admin, dev); the SCP target has
+# none, so a Vault-signed, short-lived certificate is its only way in.
+TrustedUserCAKeys {{ upstream_ssh_target_ca_file }}
+AuthorizedPrincipalsFile {{ upstream_ssh_target_principals_dir }}/%u

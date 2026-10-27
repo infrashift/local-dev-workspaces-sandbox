@@ -1,0 +1,6 @@
+# {{ ansible_managed }}
+# The proxy for systemd user services (podman's API socket, ...), which do
+# not read /etc/profile.d.
+{% for name, value in sandbox_egress_env.items() %}
+{{ name }}={{ value }}
+{% endfor %}

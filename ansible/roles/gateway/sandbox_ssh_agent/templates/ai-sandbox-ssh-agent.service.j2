@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+# The dedicated sandbox ssh-agent: it holds only the egress key and its
+# Vault-signed certificate, and only the dev session into the sandbox VM
+# forwards it (concepts/SSH Agent Forwarding). Never your own agent.
+[Unit]
+Description=ai-sandbox: the dedicated sandbox ssh-agent
+
+[Service]
+Type=simple
+RuntimeDirectory={{ sandbox_ssh_agent_socket | dirname | basename }}
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/ssh-agent -D -a {{ sandbox_ssh_agent_socket }}
+
+[Install]
+WantedBy=default.target

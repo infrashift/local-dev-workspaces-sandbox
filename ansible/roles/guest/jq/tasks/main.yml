@@ -1,0 +1,159 @@
+---
+# jq from the jqlang release binary, verified against a pinned SHA-256, into
+# ~/.local/share/jq/<version>/jq, linked into ~/.local/bin.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - jq_variant in jq_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      jq supports {{ jq_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ jq_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Assert that the play names the account it provisions
+  ansible.builtin.assert:
+    that: guest_user is defined and guest_user is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: "Set guest_user (the account this user-lane role installs for) at the play level."
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: jq_whoami
+  changed_when: false
+  check_mode: false
+
+# Everything lands in this account's home, so it must be the account running
+# the role -- files are then owned correctly by construction, with no become,
+# owner/group or chown. Facts must come from the same account: the home
+# directory is read from them.
+- name: Assert that the role runs in the user lane, as guest_user
+  ansible.builtin.assert:
+    that:
+      - jq_whoami.stdout == guest_user
+      - ansible_facts['user_id'] == guest_user
+    fail_msg: >-
+      jq installs into {{ guest_user }}'s home and must run as that account: apply
+      it from a play that connects as guest_user without become (it ran as
+      {{ jq_whoami.stdout }}; facts were gathered as {{ ansible_facts['user_id'] }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - jq_version is defined and jq_version is match('^\d+\.\d+(\.\d+)?$')
+      - jq_checksum is defined
+      - jq_checksum | length == 0 or jq_checksum is match('^[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        jq_version   X.Y or X.Y.Z (jqlang tags, e.g. 1.8.2)
+        jq_checksum  '' to use the role's pinned map, or the 64-hex SHA-256 of
+                     {{ jq_binary }} for a version the map does not pin
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "jq {{ jq_version }} ({{ jq_arch }})"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Check the installed jq version
+  ansible.builtin.command: "{{ jq_bin_dir }}/jq --version"
+  register: jq_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# `jq --version` prints exactly "jq-1.8.2". Compare the whole line: jq offers
+# both 1.7 and 1.7.1, so a substring test would accept the wrong one.
+- name: Decide whether to install jq {{ jq_version }}
+  ansible.builtin.set_fact:
+    jq_install_required: "{{ jq_installed.rc != 0 or (jq_installed.stdout | trim) != 'jq-' ~ jq_version }}"
+
+# A resolved-empty checksum means get_url would SKIP verification, not fail it.
+- name: "Assert that a checksum is available: jq {{ jq_version }}"
+  ansible.builtin.assert:
+    that: jq_effective_checksum is match('^[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      No SHA-256 is pinned for {{ jq_binary }} at jq {{ jq_version }}. Pass
+      jq_checksum to install a version or architecture the role's map does not pin.
+    quiet: true
+  when: jq_install_required
+
+- name: Would download, SHA-256 verify and install jq {{ jq_version }}
+  ansible.builtin.debug:
+    msg: "{{ jq_download_url }} -> {{ jq_install_dir }}/jq"
+  changed_when: true
+  when: jq_install_required and ansible_check_mode
+
+- name: Install jq {{ jq_version }}
+  when: jq_install_required and not ansible_check_mode
+  block:
+    - name: Remove any previously installed jq
+      ansible.builtin.file:
+        path: "{{ jq_install_root }}"
+        state: absent
+
+    - name: Create the jq install directory
+      ansible.builtin.file:
+        path: "{{ jq_install_dir }}"
+        state: directory
+        mode: "0755"
+
+    # jqlang publishes a bare binary, so it is downloaded straight into place.
+    - name: Download the jq binary (verified against the pinned SHA-256)
+      ansible.builtin.get_url:
+        url: "{{ jq_download_url }}"
+        dest: "{{ jq_install_dir }}/jq"
+        checksum: "sha256:{{ jq_effective_checksum }}"
+        mode: "0755"
+        timeout: 120
+
+- name: Ensure ~/.local/bin exists
+  ansible.builtin.file:
+    path: "{{ jq_bin_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Link jq into ~/.local/bin
+  ansible.builtin.file:
+    src: "{{ jq_install_dir }}/jq"
+    dest: "{{ jq_bin_dir }}/jq"
+    state: link
+    force: true
+  when: not (ansible_check_mode and jq_install_required)
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the REQUESTED version. Skipped only in a dry run that would
+# install.
+# ---------------------------------------------------------------------------
+- name: Verify the installed jq version
+  ansible.builtin.command: "{{ jq_bin_dir }}/jq --version"
+  register: jq_verify
+  changed_when: false
+  check_mode: false
+  when: not (ansible_check_mode and jq_install_required)
+
+- name: "Assert that the requested version is installed: jq {{ jq_version }}"
+  ansible.builtin.assert:
+    that: (jq_verify.stdout | trim) == 'jq-' ~ jq_version
+    fail_msg: "Expected jq-{{ jq_version }}; {{ jq_bin_dir }}/jq reported: {{ jq_verify.stdout }}"
+    success_msg: "{{ jq_verify.stdout | trim }}"
+  when: not (ansible_check_mode and jq_install_required)
+...

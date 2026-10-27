@@ -1,0 +1,136 @@
+---
+# apt packages the labs need, plus read-only checks that this host can run
+# x86_64 guests under KVM through libvirt (qemu:///system) without sudo.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+- name: Assert this host is Debian-family (apt)
+  ansible.builtin.assert:
+    that: ansible_facts['os_family'] == 'Debian'
+    fail_msg: "This role installs with apt; got os_family {{ ansible_facts['os_family'] }}"
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - linux_host_packages_packages is defined and linux_host_packages_packages is sequence
+      - linux_host_packages_packages is not string and linux_host_packages_packages | length > 0
+      - linux_host_packages_packages | reject('match', '^[a-z0-9][a-z0-9.+-]*$') | list | length == 0
+      - linux_host_packages_groups is defined and linux_host_packages_groups is sequence
+      - linux_host_packages_groups is not string
+      - linux_host_packages_groups | reject('match', '^[a-z][a-z0-9_-]*$') | list | length == 0
+      - linux_host_packages_firmware is defined and linux_host_packages_firmware is sequence
+      - linux_host_packages_firmware is not string and linux_host_packages_firmware | length == 2
+      - linux_host_packages_firmware | reject('match', '^/[^ ]+$') | list | length == 0
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        linux_host_packages_packages  non-empty list of apt package names
+        linux_host_packages_groups    groups the operator must already be in (e.g. libvirt, kvm)
+        linux_host_packages_firmware  [OVMF code, OVMF vars] absolute paths (the pflash pair VMs boot from)
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "{{ linux_host_packages_packages | join(', ') }}; groups {{ linux_host_packages_groups | join(', ') }}"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+# No update_cache: a cache refresh reports "changed" on every run, and the
+# bootstrap's readiness check needs a re-run to find nothing to do.
+- name: Install apt packages
+  ansible.builtin.apt:
+    name: "{{ linux_host_packages_packages }}"
+    state: present
+  become: true
+
+- name: Stat /dev/kvm
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: linux_host_packages_kvm
+
+- name: Assert that KVM is available
+  ansible.builtin.assert:
+    that: linux_host_packages_kvm.stat.exists and linux_host_packages_kvm.stat.ischr
+    fail_msg: "/dev/kvm is missing: enable virtualization (VT-x/AMD-V) in firmware and load kvm_intel/kvm_amd."
+    quiet: true
+
+# Group membership is the operator's to grant (it needs a new login session),
+# so it is checked, not changed.
+- name: Read the operator's groups
+  ansible.builtin.command: id -nG {{ linux_host_packages_operator }}
+  register: linux_host_packages_id
+  changed_when: false
+  check_mode: false
+
+- name: Assert that the operator is in every required group
+  ansible.builtin.assert:
+    that: linux_host_packages_groups | difference(linux_host_packages_id.stdout.split()) | length == 0
+    fail_msg: >-
+      {{ linux_host_packages_operator }} is not in
+      {{ linux_host_packages_groups | difference(linux_host_packages_id.stdout.split()) | join(', ') }}. Run:
+      sudo usermod -aG {{ linux_host_packages_groups | join(',') }} {{ linux_host_packages_operator }}
+      then log out and back in.
+    quiet: true
+
+# In a dry run on a fresh host OVMF is not installed yet; these checks then
+# wait for the real run.
+- name: Stat the OVMF firmware pair
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ linux_host_packages_firmware }}"
+  register: linux_host_packages_ovmf
+
+- name: Assert the firmware code and vars images exist
+  ansible.builtin.assert:
+    that: linux_host_packages_ovmf.results | map(attribute='stat.exists') | min
+    fail_msg: "{{ linux_host_packages_firmware | join(' / ') }} missing (the ovmf package installs them)"
+    quiet: true
+  when: (linux_host_packages_ovmf.results | map(attribute='stat.exists') | min) or not ansible_check_mode
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — every requested package is installed.
+# ---------------------------------------------------------------------------
+- name: Query the installed versions of the requested packages
+  ansible.builtin.command:
+    argv: [dpkg-query, -W, "-f=${Status} ${Version}", "{{ item }}"]
+  loop: "{{ linux_host_packages_packages }}"
+  register: linux_host_packages_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Assert that every requested package is installed
+  ansible.builtin.assert:
+    that: item.rc == 0 and item.stdout is match('^install ok installed ')
+    fail_msg: "{{ item.item }} is not installed (dpkg-query said: '{{ item.stdout | trim }}' rc={{ item.rc }})"
+    success_msg: "{{ item.item }} {{ item.stdout.split() | last }}"
+  loop: "{{ linux_host_packages_installed.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+...

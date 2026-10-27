@@ -1,0 +1,24 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries are asserted against their prerequisites rather than assumed.
+system_packages_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+system_packages_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# ROLE CONSTANTS — not caller-settable.
+#
+# The Python bindings each package manager's Ansible module imports, and the
+# CLI that installs them before the module can work. Fedora 41+ is dnf5; EL 9
+# and 10 are dnf 4.
+# ---------------------------------------------------------------------------
+system_packages_bindings:
+  dnf5: { package: python3-libdnf5, cli: /usr/bin/dnf5 }
+  dnf: { package: python3-dnf, cli: /usr/bin/dnf }
+system_packages_binding: "{{ system_packages_bindings[ansible_facts['pkg_mgr']].package }}"
+system_packages_dnf: "{{ system_packages_bindings[ansible_facts['pkg_mgr']].cli }}"
+...

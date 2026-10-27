@@ -1,0 +1,24 @@
+---
+# Ported from: trusted-devcontainer-templates features/src/tmux/ansible-role-feature @ 15f68d3
+galaxy_info:
+  author: infrashift
+  description: tmux, a system-wide configuration and an editor | shell dev-session layout for Fedora and EL guests
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Fedora
+      versions:
+        - "44"
+    - name: EL
+      versions:
+        - "9"
+        - "10"
+  galaxy_tags:
+    - tmux
+    - terminal
+    - fedora
+    - rhel
+
+dependencies: []
+...

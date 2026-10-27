@@ -1,0 +1,55 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Envoy: the ai-sandbox zero-trust gateway
+Documentation=https://www.envoyproxy.io/docs
+After=network-online.target vault-proxy.service ai-sandbox-consul-template.service
+Wants=network-online.target vault-proxy.service ai-sandbox-consul-template.service
+
+[Service]
+User={{ envoy_gateway_user }}
+Group={{ envoy_gateway_user }}
+# :{{ envoy_gateway_gateway_port }} is a privileged port.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# The admin sockets (admin.sock envoy-only, admin-readonly.sock GET-only).
+RuntimeDirectory={{ envoy_gateway_runtime_dir | basename }}
+RuntimeDirectoryMode=0755
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ExecStartPre={{ envoy_gateway_bin }} --mode validate -c {{ envoy_gateway_config }} --log-level error
+# No hot restart: it needs shared memory this sandboxed unit does not grant.
+ExecStart={{ envoy_gateway_bin }} -c {{ envoy_gateway_config }} --log-level info --disable-hot-restart
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+# Sandboxing: systemd-analyze security scores it, and the role asserts that score.
+ProtectSystem=strict
+ReadOnlyPaths=/
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+KeyringMode=private
+DevicePolicy=closed
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+# No MemoryDenyWriteExecute: the surrogate filter's LuaJIT compiles to
+# executable memory.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

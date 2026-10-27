@@ -1,0 +1,194 @@
+---
+# Point every egress of a sandbox guest at the zero-trust gateway
+# (concepts/Zero-Trust Surrogate Gateway). The guest's network is isolated:
+# it has no route and no DNS, so this is not what CONFINES it (the host
+# does that), it is what makes its tools WORK there:
+#   /etc/hosts          the gateway's names -> the gateway address
+#   proxy environment   HTTPS_PROXY for login shells and systemd user units,
+#                       NO_PROXY for the gateway's names
+#   dnf                 the proxy, and one pinned mirror instead of metalink
+#   ssh                 a ProxyCommand through the CONNECT tunnel (ncat)
+# Must run before anything that downloads (ca_trust's probes,
+# system_packages); the play passes the same proxy to its own tasks.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - sandbox_egress_variant in sandbox_egress_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      sandbox_egress supports {{ sandbox_egress_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ sandbox_egress_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: sandbox_egress_whoami
+  changed_when: false
+  check_mode: false
+
+- name: Assert that the role runs in the system lane
+  ansible.builtin.assert:
+    that: sandbox_egress_whoami.stdout == 'root'
+    fail_msg: >-
+      sandbox_egress writes system state and must run as root: apply it from a play with
+      become: true (it ran as {{ sandbox_egress_whoami.stdout }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - sandbox_egress_gateway_ip is defined and sandbox_egress_gateway_ip is match('^(\d{1,3}\.){3}\d{1,3}$')
+      - sandbox_egress_proxy_port is defined and sandbox_egress_proxy_port | int > 0
+      - sandbox_egress_gateway_hosts is defined and sandbox_egress_gateway_hosts is sequence
+      - sandbox_egress_gateway_hosts is not string and sandbox_egress_gateway_hosts | length > 0
+      - sandbox_egress_gateway_hosts | reject('match', '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$') | list | length == 0
+      # SHAPE VALIDATION: rendered into repository files dnf trusts.
+      - sandbox_egress_fedora_mirror is defined
+      - sandbox_egress_fedora_mirror is match('^https://[a-z0-9.-]+(/[A-Za-z0-9._-]+)*$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        sandbox_egress_gateway_ip     the gateway's address on the sandbox network (GATEWAY_IP)
+        sandbox_egress_proxy_port     the CONNECT tunnel's port (PROXY_PORT)
+        sandbox_egress_gateway_hosts  the TLS gateway's host names (vars/gateway.yml)
+        sandbox_egress_fedora_mirror  https://<mirror>/<path to the fedora tree>, no trailing slash
+                                      (it must be on the egress allow list)
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      proxy {{ sandbox_egress_proxy_url }}; {{ sandbox_egress_gateway_hosts | join(', ') }} ->
+      {{ sandbox_egress_gateway_ip }}; dnf from {{ sandbox_egress_fedora_mirror }}
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS — everything written here is root-owned.
+# ---------------------------------------------------------------------------
+- name: Map the gateway's names to the gateway in /etc/hosts
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} ai-sandbox gateway (Ansible managed)"
+    block: "{{ sandbox_egress_gateway_ip }} {{ sandbox_egress_gateway_hosts | join(' ') }}"
+
+- name: Write the proxy environment
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: proxy.profile.sh.j2, dest: "{{ sandbox_egress_profile }}" }
+    - { src: proxy.environment.conf.j2, dest: "{{ sandbox_egress_environment_d }}" }
+  loop_control:
+    label: "{{ item.dest }}"
+
+- name: Send dnf through the gateway
+  community.general.ini_file:
+    path: /etc/dnf/dnf.conf
+    section: main
+    option: proxy
+    value: "{{ sandbox_egress_proxy_url }}"
+    mode: "0644"
+
+- name: Drop the metalink from the pinned repositories (dnf would prefer it)
+  community.general.ini_file:
+    path: "/etc/yum.repos.d/{{ item.file }}"
+    section: "{{ item.section }}"
+    option: metalink
+    state: absent
+    mode: "0644"
+  loop: "{{ sandbox_egress_repos }}"
+  loop_control:
+    label: "{{ item.section }}"
+
+- name: Set each pinned repository's baseurl
+  community.general.ini_file:
+    path: "/etc/yum.repos.d/{{ item.file }}"
+    section: "{{ item.section }}"
+    option: baseurl
+    value: "{{ sandbox_egress_fedora_mirror }}/{{ item.path }}"
+    mode: "0644"
+  loop: "{{ sandbox_egress_repos }}"
+  loop_control:
+    label: "{{ item.section }}"
+
+- name: Turn off repositories outside the allow list
+  community.general.ini_file:
+    path: "/etc/yum.repos.d/{{ item.file }}"
+    section: "{{ item.section }}"
+    option: enabled
+    value: "0"
+    mode: "0644"
+  loop: "{{ sandbox_egress_disabled_repos }}"
+  loop_control:
+    label: "{{ item.section }}"
+
+- name: Install {{ sandbox_egress_packages | join(', ') }}
+  ansible.builtin.dnf:
+    name: "{{ sandbox_egress_packages }}"
+    state: present
+
+- name: Send ssh through the CONNECT tunnel
+  ansible.builtin.template:
+    src: ssh-proxy.conf.j2
+    dest: "{{ sandbox_egress_ssh_config }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the gateway's names resolve to the gateway, and dnf can
+# reach the pinned mirror through the tunnel.
+# ---------------------------------------------------------------------------
+- name: Resolve the gateway's names
+  ansible.builtin.command: getent hosts {{ sandbox_egress_gateway_hosts | join(' ') }}
+  register: sandbox_egress_resolved
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Fetch the pinned mirror's repository index through the tunnel
+  ansible.builtin.uri:
+    url: >-
+      {{ sandbox_egress_fedora_mirror }}/{{ sandbox_egress_repos[0].path
+         | replace('$releasever', ansible_facts['distribution_major_version'])
+         | replace('$basearch', ansible_facts['architecture']) }}repodata/repomd.xml
+    use_proxy: true
+  environment: "{{ sandbox_egress_env }}"
+  register: sandbox_egress_mirror
+  # The mirror occasionally leaves a connection unanswered (Envoy's 5 s
+  # connect timeout, 503 UF): retry before failing.
+  until: sandbox_egress_mirror.status == 200
+  retries: 2
+  delay: 5
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Assert the gateway's names resolve to the gateway and the mirror answers through it
+  ansible.builtin.assert:
+    that:
+      - sandbox_egress_resolved.stdout_lines | map('split') | map('first') | unique == [sandbox_egress_gateway_ip]
+      - sandbox_egress_resolved.stdout_lines | length == sandbox_egress_gateway_hosts | length
+      - sandbox_egress_mirror.status == 200
+    fail_msg: >-
+      getent: {{ sandbox_egress_resolved.stdout_lines }}; mirror through the tunnel:
+      {{ sandbox_egress_mirror.status | default('not tried') }}
+    success_msg: >-
+      {{ sandbox_egress_gateway_hosts | length }} gateway names -> {{ sandbox_egress_gateway_ip }}; mirror OK
+  when: not ansible_check_mode
+...

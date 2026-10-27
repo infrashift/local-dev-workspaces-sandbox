@@ -1,0 +1,17 @@
+# {{ ansible_managed }}
+[Unit]
+Description=ai-sandbox: the sandbox network's host firewall (nft table inet {{ sandbox_firewall_table }})
+# Before the bridge can carry a packet: libvirt brings it up later.
+DefaultDependencies=no
+Before=network-pre.target libvirtd.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f {{ sandbox_firewall_rules }}
+ExecReload=/usr/sbin/nft -f {{ sandbox_firewall_rules }}
+ExecStop=/usr/sbin/nft delete table inet {{ sandbox_firewall_table }}
+
+[Install]
+WantedBy=multi-user.target

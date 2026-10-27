@@ -1,0 +1,8 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES. Not caller-settable: defaults/ is reserved for inputs, and
+# this role has none.
+# ---------------------------------------------------------------------------
+# Shown in task names.
+release_binary_label: "{{ release_binary_name }} {{ release_binary_version }}"
+...

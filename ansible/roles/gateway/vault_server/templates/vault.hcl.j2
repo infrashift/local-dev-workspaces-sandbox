@@ -1,0 +1,25 @@
+# {{ ansible_managed }}
+# A single-node lab Vault on a unix socket only (concepts/Vault and Consul
+# Host Trust): no TCP port at all, so nothing off this host -- and no process
+# or container on it -- reaches Vault's API except through the socket, which
+# opens for the {{ vault_server_socket_group }} group (services, by their units'
+# SupplementaryGroups) and, by ACL, the operators. TLS would add nothing on a
+# socket the kernel guards.
+#
+# Storage is the file backend, not raft: raft needs a TCP cluster listener,
+# and one node gets nothing from it. disable_clustering for the same reason.
+ui                 = false
+disable_mlock      = true
+disable_clustering = true
+
+storage "file" {
+  path = "{{ vault_server_storage_dir }}"
+}
+
+# socket_mode and socket_group are Agent/Proxy-only: vault.service's
+# ExecStartPost sets the socket's group, mode and ACL instead.
+listener "unix" {
+  address = "{{ vault_server_socket }}"
+}
+
+api_addr = "unix://{{ vault_server_socket }}"

@@ -1,0 +1,62 @@
+[[- /*
+  {{ ansible_managed }}
+  consul-template renders Envoy's CONNECT route table from the egress allow
+  list in Consul K/V (concepts/Egress Allow List in Consul KV):
+    {{ envoy_gateway_kv_prefix }}/baseline/<category>/<host>:<port>   Ansible-owned
+    {{ envoy_gateway_kv_prefix }}/allow/<host>:<port>                 operator-owned
+  Rules, so a bad entry can never break or widen the table:
+    * a key that is not <host>:<port> or *.<suffix>:<port> is skipped;
+    * duplicates collapse (Envoy rejects a route table with repeated domains);
+    * a gateway host is never tunnelled: its exact names are skipped, and an
+      exact deny entry for each allowed port outranks any wildcard that would
+      cover it (Envoy prefers exact domains to suffix wildcards).
+  Delimiters are [[ ]] so Ansible's Jinja leaves this file alone.
+*/ -]]
+[[- $gateway := split "," "{{ envoy_gateway_routes | map(attribute='host') | join(',') }}" -]]
+[[- range tree "{{ envoy_gateway_kv_prefix }}/baseline" ]][[ scratch.MapSet "entries" (regexReplaceAll ".*/" "" .Key) "baseline" ]][[ end -]]
+[[- range ls "{{ envoy_gateway_kv_prefix }}/allow" ]][[ scratch.MapSet "entries" .Key "allow" ]][[ end -]]
+[[- range $entry, $source := scratch.Get "entries" ]]
+[[- if regexMatch "^(\\*\\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*:[0-9]{1,5}$" $entry ]]
+[[- $host := regexReplaceAll ":[0-9]+$" "" $entry ]][[ $port := regexReplaceAll "^.*:" "" $entry ]]
+[[- scratch.MapSet "ports" $port $port ]]
+[[- $isgateway := false ]][[ range $gateway ]][[ if eq . $host ]][[ $isgateway = true ]][[ end ]][[ end ]]
+[[- if not $isgateway ]][[ scratch.MapSet "allowed" $entry $source ]][[ end ]]
+[[- end ]]
+[[- end -]]
+resources:
+  - "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+    name: connect_routes
+    virtual_hosts:
+[[- if scratch.Key "allowed" ]]
+      - name: allow
+        domains:
+[[- range $entry, $source := scratch.Get "allowed" ]]
+          - "[[ $entry ]]"  # [[ $source ]]
+[[- end ]]
+        routes:
+          - match: { connect_matcher: {} }
+            route:
+              cluster: connect_dynamic_forward_proxy
+              upgrade_configs:
+                - upgrade_type: CONNECT
+                  connect_config: {}
+[[- end ]]
+[[- if scratch.Key "ports" ]]
+      - name: gateway_hosts
+        domains:
+[[- range $port, $_ := scratch.Get "ports" ]][[ range $gateway ]]
+          - "[[ . ]]:[[ $port ]]"
+[[- end ]][[ end ]]
+        routes:
+          - match: { connect_matcher: {} }
+            direct_response:
+              status: 403
+              body: { inline_string: "ai-sandbox egress: this host is served by the TLS gateway, not the tunnel\n" }
+[[- end ]]
+      - name: deny
+        domains: ["*"]
+        routes:
+          - match: { connect_matcher: {} }
+            direct_response:
+              status: 403
+              body: { inline_string: "ai-sandbox egress: not on the allow list\n" }

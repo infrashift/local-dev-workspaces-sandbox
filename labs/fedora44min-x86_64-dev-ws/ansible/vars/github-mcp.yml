@@ -1,0 +1,22 @@
+---
+# The GitHub MCP server (github/github-mcp-server), one pin for both places it
+# runs (concepts/GitHub MCP Servers Behind the Gateway):
+#   the sandbox (python-stack.yml)  over stdio, for Claude Code, with the
+#                                   github_token surrogate; its API calls go
+#                                   through the TLS gateway
+#   upstream-1 (upstream.yml)       in http mode behind TLS: the self-hosted
+#                                   remote server, reached through the TLS
+#                                   gateway with the github_mcp surrogate
+# The SHA-256 is the release's own (github-mcp-server_<version>_checksums.txt)
+# for the Linux_x86_64 tarball, checked against the GitHub release asset
+# digest when the pin was set.
+github_mcp_version: "2.0.3"
+github_mcp_sha256: f797c20fe02a755865d0e2d46184ab47e31bf1619b0855b8d89c531e45a651c2
+
+# Read-only tools only, on both: the test PAT is read-only anyway, and an
+# agent's MCP server should not hold more than the task needs.
+github_mcp_read_only: true
+
+# GitHub's hosted remote MCP server; /readonly limits it to read tools.
+github_mcp_hosted_url: https://api.githubcopilot.com/mcp/readonly
+...

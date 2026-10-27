@@ -1,0 +1,41 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries are asserted against their prerequisites rather than assumed.
+uv_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+uv_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS — not caller-settable.
+#
+# The user lane connects as guest_user, so the facts describe that account.
+# astral-sh names its assets by GNU triple, and the contract bracket admits
+# only the two architectures that map onto one.
+# ---------------------------------------------------------------------------
+uv_home: "{{ ansible_facts['user_dir'] }}"
+uv_bin_dir: "{{ uv_home }}/.local/bin"
+uv_platform: "{{ ansible_facts['architecture'] }}-unknown-linux-gnu"
+uv_tarball: "uv-{{ uv_platform }}.tar.gz"
+uv_download_url: "https://github.com/astral-sh/uv/releases/download/{{ uv_version }}/{{ uv_tarball }}"
+uv_install_root: "{{ uv_home }}/.local/share/uv-dist"
+uv_install_dir: "{{ uv_install_root }}/{{ uv_version }}"
+uv_version_pattern: "^uv {{ uv_version | regex_escape }}( |$)"
+
+# SHA-256 digests pinned per version, per platform, from the .sha256 files
+# astral-sh publishes beside each asset. A pair absent here resolves to '' and
+# is caught by the checksum assert in tasks/main.yml.
+uv_pinned_checksums:
+  "0.13.5":
+    aarch64-unknown-linux-gnu: "4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403"
+    x86_64-unknown-linux-gnu: "f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f"
+
+# An explicit uv_checksum wins, otherwise the pinned value. The input and the
+# resolved value need separate names: set_fact cannot override a role param.
+uv_effective_checksum: >-
+  {{ uv_checksum if uv_checksum | length > 0
+     else uv_pinned_checksums.get(uv_version, {}).get(uv_platform, '') }}
+...

@@ -1,0 +1,35 @@
+---
+# Variants this role supports: the dnf repository pin names Fedora's layout.
+sandbox_egress_compatibility_list:
+  - fedora44
+sandbox_egress_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# ROLE CONSTANTS
+# ---------------------------------------------------------------------------
+sandbox_egress_proxy_url: "http://{{ sandbox_egress_gateway_ip }}:{{ sandbox_egress_proxy_port }}"
+# Hosts reached directly (the gateway's names resolve to the gateway itself).
+sandbox_egress_no_proxy: >-
+  {{ (['localhost', '127.0.0.1', '::1', sandbox_egress_gateway_ip] + sandbox_egress_gateway_hosts) | join(',') }}
+sandbox_egress_profile: /etc/profile.d/ai-sandbox-proxy.sh
+sandbox_egress_environment_d: /etc/environment.d/40-ai-sandbox-proxy.conf
+sandbox_egress_ssh_config: /etc/ssh/ssh_config.d/50-ai-sandbox-proxy.conf
+# Every name a tool may read the proxy from.
+sandbox_egress_env:
+  HTTP_PROXY: "{{ sandbox_egress_proxy_url }}"
+  HTTPS_PROXY: "{{ sandbox_egress_proxy_url }}"
+  http_proxy: "{{ sandbox_egress_proxy_url }}"
+  https_proxy: "{{ sandbox_egress_proxy_url }}"
+  NO_PROXY: "{{ sandbox_egress_no_proxy }}"
+  no_proxy: "{{ sandbox_egress_no_proxy }}"
+# The one mirror dnf may use (metalink would pick arbitrary mirrors that the
+# allow list does not name). Fedora's own repository files are edited in
+# place; the Cisco OpenH264 repository (codecs.fedoraproject.org) is off.
+sandbox_egress_repos:
+  - { file: fedora.repo, section: fedora, path: "releases/$releasever/Everything/$basearch/os/" }
+  - { file: fedora-updates.repo, section: updates, path: "updates/$releasever/Everything/$basearch/" }
+sandbox_egress_disabled_repos:
+  - { file: fedora-cisco-openh264.repo, section: fedora-cisco-openh264 }
+sandbox_egress_packages:
+  - nmap-ncat
+...

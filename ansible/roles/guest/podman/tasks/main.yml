@@ -1,0 +1,261 @@
+---
+# Podman, configured for ONE mode, so the end state is unambiguous:
+#
+#   rootless  containers run as podman_rootless_user: its subordinate id
+#             ranges are asserted, lingering is enabled so its user manager
+#             (and the API socket) outlive logins, its podman.socket is enabled,
+#             and the root socket is disabled.
+#   rootful   containers run as root: the system podman.socket is enabled.
+#
+# System lane: everything here is root's to change. The rootless user's own
+# systemd manager is driven with `systemctl --user -M <user>@`, and the final
+# check runs `podman info` as that user through runuser, so no step needs
+# Ansible to become an unprivileged account.
+#
+# Registry pulls verify TLS with the system trust store, so after ca_trust they
+# work behind the gateway (or any TLS-intercepting proxy) in both modes. Builds INSIDE containers do not: an image
+# carries its own trust store.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - podman_variant in podman_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      podman supports {{ podman_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ podman_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: podman_whoami
+  changed_when: false
+  check_mode: false
+
+- name: Assert that the role runs in the system lane
+  ansible.builtin.assert:
+    that: podman_whoami.stdout == 'root'
+    fail_msg: >-
+      podman writes system state and must run as root: apply it from a play with
+      become: true (it ran as {{ podman_whoami.stdout }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+#
+# podman_rootless_user is pass-through: it must be DEFINED in both modes, and
+# is empty exactly when podman_mode is rootful.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - podman_mode is defined and podman_mode in ['rootful', 'rootless']
+      - podman_rootless_user is defined
+      - (podman_mode == 'rootless') == (podman_rootless_user | length > 0)
+      - podman_rootless_user | length == 0 or podman_rootless_user is match('^[a-z_][a-z0-9_-]*$')
+      - podman_rootless_user != 'root'
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        podman_mode           rootful | rootless
+        podman_rootless_user  the account that runs containers when rootless;
+                              '' (empty) when rootful
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "podman {{ podman_mode }}{{ ' for ' ~ podman_rootless_user if podman_mode == 'rootless' else '' }}"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Install {{ podman_packages | join(', ') }}
+  ansible.builtin.package:
+    name: "{{ podman_packages }}"
+    state: present
+  register: podman_installed
+
+- name: Configure rootless podman for {{ podman_rootless_user }}
+  when: podman_mode == 'rootless'
+  block:
+    - name: Look up {{ podman_rootless_user }}
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ podman_rootless_user }}"
+        fail_key: false
+
+    - name: "Assert that the rootless user exists: {{ podman_rootless_user }}"
+      ansible.builtin.assert:
+        that:
+          - podman_rootless_user in ansible_facts['getent_passwd']
+          - ansible_facts['getent_passwd'][podman_rootless_user] is not none
+        fail_msg: "podman_rootless_user {{ podman_rootless_user }} does not exist on this guest."
+        quiet: true
+
+    - name: Record the rootless user's uid and home
+      ansible.builtin.set_fact:
+        podman_uid: "{{ ansible_facts['getent_passwd'][podman_rootless_user][1] }}"
+        podman_home: "{{ ansible_facts['getent_passwd'][podman_rootless_user][4] }}"
+
+    # useradd assigns a range from /etc/login.defs (SUB_UID_MIN ...) when an
+    # account is created, and cloud-init creates the lab users with useradd.
+    # An account without one cannot map a container's users at all; picking a
+    # range here could collide with one already handed out, so say how to fix
+    # it instead.
+    - name: Read /etc/subuid and /etc/subgid
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop: [/etc/subuid, /etc/subgid]
+      register: podman_subids
+
+    - name: "Assert that the rootless user has subordinate uid and gid ranges: {{ podman_rootless_user }}"
+      ansible.builtin.assert:
+        that: >-
+          (item.content | b64decode
+           | regex_findall('(?m)^' ~ (podman_rootless_user | regex_escape) ~ ':\d+:(\d+)$')
+           | map('int') | sum) >= podman_subid_min
+        fail_msg: >-
+          {{ item.item }} gives {{ podman_rootless_user }} fewer than {{ podman_subid_min }} ids.
+          Add a range that no other account uses, e.g.:
+            usermod --add-subuids 100000-165535 --add-subgids 100000-165535 {{ podman_rootless_user }}
+        quiet: true
+      loop: "{{ podman_subids.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: "Enable lingering, so the user manager survives logout: {{ podman_rootless_user }}"
+      ansible.builtin.command:
+        cmd: loginctl enable-linger {{ podman_rootless_user }}
+        creates: /var/lib/systemd/linger/{{ podman_rootless_user }}
+
+    # One call for both states. Right after lingering starts the user manager
+    # its bus can refuse a call, so retry; then fail by name. A probe that
+    # could not ask must never read as "not active" and turn into a change.
+    - name: Read the rootless user's podman.socket state
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - --user
+          - --machine
+          - "{{ podman_rootless_user }}@"
+          - show
+          - podman.socket
+          - --property=ActiveState
+          - --property=UnitFileState
+      register: podman_user_socket
+      until: podman_user_socket.rc == 0 or ansible_check_mode
+      retries: 5
+      delay: 2
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # In a dry run lingering may not be enabled yet, so there is no user
+    # manager to ask; that is a pending change, not a failure.
+    - name: Assert that the rootless user's systemd manager answered
+      ansible.builtin.assert:
+        that: podman_user_socket.rc == 0
+        fail_msg: >-
+          systemctl --user --machine {{ podman_rootless_user }}@ could not reach
+          {{ podman_rootless_user }}'s user manager, which lingering should have started:
+          {{ podman_user_socket.stderr | trim }}
+        quiet: true
+      when: not ansible_check_mode
+
+    - name: Decide whether the rootless user's podman.socket needs enabling
+      ansible.builtin.set_fact:
+        podman_user_socket_ready: >-
+          {{ podman_user_socket.rc == 0
+             and 'ActiveState=active' in podman_user_socket.stdout_lines
+             and 'UnitFileState=enabled' in podman_user_socket.stdout_lines }}
+
+    # command is skipped in a dry run and would report nothing; this task is
+    # what tells ansible-confirm.sh there is a change to apply.
+    - name: Would enable and start the rootless user's podman.socket
+      ansible.builtin.debug:
+        msg: "systemctl --user --machine {{ podman_rootless_user }}@ enable --now podman.socket"
+      changed_when: true
+      when: not podman_user_socket_ready and ansible_check_mode
+
+    - name: Enable and start the rootless user's podman.socket
+      ansible.builtin.command:
+        argv: [systemctl, --user, --machine, "{{ podman_rootless_user }}@", enable, --now, podman.socket]
+      changed_when: true
+      when: not podman_user_socket_ready and not ansible_check_mode
+
+    - name: Disable the root podman.socket (rootless mode)
+      ansible.builtin.systemd_service:
+        name: podman.socket
+        enabled: false
+        state: stopped
+      when: not (ansible_check_mode and podman_installed is changed)
+
+- name: Enable and start the root podman.socket (rootful mode)
+  ansible.builtin.systemd_service:
+    name: podman.socket
+    enabled: true
+    state: started
+  when:
+    - podman_mode == 'rootful'
+    - not (ansible_check_mode and podman_installed is changed)
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — podman itself reports the mode, storage and id mapping, and
+# the API socket is listening. Skipped in a dry run with changes pending.
+# ---------------------------------------------------------------------------
+- name: Decide whether podman can be verified
+  ansible.builtin.set_fact:
+    podman_verifiable: >-
+      {{ not ansible_check_mode
+         or not (podman_installed is changed
+                 or (podman_mode == 'rootless' and not podman_user_socket_ready)) }}
+
+- name: Run podman info as {{ podman_rootless_user if podman_mode == 'rootless' else 'root' }}
+  ansible.builtin.command:
+    argv: "{{ podman_info_argv }}"
+    # runuser keeps the caller's directory, and the rootless user cannot enter
+    # admin's home.
+    chdir: "{{ podman_home if podman_mode == 'rootless' else '/' }}"
+  register: podman_info
+  changed_when: false
+  check_mode: false
+  when: podman_verifiable
+
+- name: Stat the podman API socket
+  ansible.builtin.stat:
+    path: "{{ podman_socket_path }}"
+  register: podman_socket
+  when: podman_verifiable
+
+- name: "Assert podman's mode, overlay storage and API socket: {{ podman_mode }}"
+  ansible.builtin.assert:
+    that:
+      - podman_info_json.host.security.rootless == (podman_mode == 'rootless')
+      - podman_info_json.store.graphDriverName == 'overlay'
+      - >-
+        podman_mode == 'rootful'
+        or (podman_info_json.host.idMappings.uidmap | map(attribute='size') | sum) > podman_subid_min
+      - podman_socket.stat.exists and podman_socket.stat.issock
+    fail_msg: >-
+      podman is not set up {{ podman_mode }}: rootless={{ podman_info_json.host.security.rootless }},
+      graph driver {{ podman_info_json.store.graphDriverName }},
+      uid map {{ podman_info_json.host.idMappings.uidmap }},
+      socket {{ podman_socket_path }} present={{ podman_socket.stat.exists }}
+    success_msg: >-
+      podman {{ podman_info_json.version.Version }} {{ podman_mode }}
+      ({{ podman_info_json.store.graphDriverName }}, network {{ podman_info_json.host.networkBackend }}),
+      API at {{ podman_socket_path }}
+  vars:
+    podman_info_json: "{{ podman_info.stdout | from_json }}"
+  when: podman_verifiable
+...

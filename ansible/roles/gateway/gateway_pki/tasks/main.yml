@@ -1,0 +1,334 @@
+---
+# Two small private CAs:
+#   gateway CA   signs Envoy's TLS-gateway certificate (SANs: every gateway
+#                host; no IP). The sandbox guests trust it, so
+#                they accept Envoy as github.com, api.anthropic.com, ...
+#                Its key is root-only and never leaves the host.
+#   upstream CA  signs the lab's own upstream test servers (the GitHub MCP
+#                server on upstream-1); Envoy verifies them with it.
+# community.crypto regenerates nothing that is still valid, so a re-run is a
+# no-op.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - gateway_pki_dir is defined and gateway_pki_dir is match('^/[^ ]+$')
+      - gateway_pki_key_group is defined and gateway_pki_key_group is match('^[a-z][a-z0-9_-]*$')
+      - gateway_pki_gateway_hosts is defined and gateway_pki_gateway_hosts is sequence
+      - gateway_pki_gateway_hosts is not string and gateway_pki_gateway_hosts | length > 0
+      - gateway_pki_gateway_hosts | reject('match', '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$') | list | length == 0
+      - gateway_pki_trust_export_dir is defined and gateway_pki_trust_export_dir is match('^/[^ ]+$')
+      - gateway_pki_upstream_dir is defined and gateway_pki_upstream_dir is match('^/[^ ]+$')
+      - gateway_pki_upstream_hosts is defined and gateway_pki_upstream_hosts is sequence
+      - gateway_pki_upstream_hosts is not string and gateway_pki_upstream_hosts | length > 0
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        gateway_pki_dir               absolute root-owned directory for the gateway CA and Envoy's key pair
+        gateway_pki_key_group         group that may read Envoy's key (envoy)
+        gateway_pki_gateway_hosts     non-empty list of DNS names the TLS gateway serves (vars/gateway.yml)
+        gateway_pki_trust_export_dir  absolute directory the guests' CA trust is read from (CA_TRUST_DIR)
+        gateway_pki_upstream_dir      absolute operator-owned directory for the upstream-test CA
+        gateway_pki_upstream_hosts    non-empty list of DNS names the upstream test server answers to
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      gateway certificate for {{ gateway_pki_gateway_hosts | join(', ') }} (no IP);
+      CA exported to {{ gateway_pki_ca_export }}
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Create the key group
+  ansible.builtin.group:
+    name: "{{ gateway_pki_key_group }}"
+    system: true
+  become: true
+
+- name: Create the PKI directory's parent (world-traversable, root-owned)
+  ansible.builtin.file:
+    path: "{{ gateway_pki_dir | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+- name: Create the gateway PKI directory (root, group-traversable)
+  ansible.builtin.file:
+    path: "{{ gateway_pki_dir }}"
+    state: directory
+    owner: root
+    group: "{{ gateway_pki_key_group }}"
+    mode: "0750"
+  become: true
+
+- name: Create the operator's PKI directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ gateway_pki_trust_export_dir }}", mode: "0755" }
+    - { path: "{{ gateway_pki_upstream_dir }}", mode: "0700" }
+  loop_control:
+    label: "{{ item.path }}"
+
+# In a dry run on a fresh host the directories above do not exist yet, so the
+# key and certificate tasks would fail; report what they would create instead.
+- name: Check whether the PKI directories exist
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: ["{{ gateway_pki_dir }}", "{{ gateway_pki_trust_export_dir }}", "{{ gateway_pki_upstream_dir }}"]
+  register: gateway_pki_dirs
+  become: true
+
+- name: Decide whether the key and certificate tasks can run
+  ansible.builtin.set_fact:
+    gateway_pki_ready: "{{ not ansible_check_mode or (gateway_pki_dirs.results | map(attribute='stat.exists') | min) }}"
+
+- name: Would create the gateway and upstream-test CAs and certificates
+  ansible.builtin.debug:
+    msg: >-
+      {{ gateway_pki_ca_cert }}, {{ gateway_pki_leaf_cert }}, {{ gateway_pki_upstream_ca_cert }},
+      {{ gateway_pki_upstream_leaf_cert }}
+  changed_when: true
+  when: not gateway_pki_ready
+
+- name: Issue the gateway CA and Envoy's certificate
+  when: gateway_pki_ready
+  become: true
+  block:
+    - name: Create the gateway CA key
+      community.crypto.openssl_privatekey:
+        path: "{{ gateway_pki_ca_key }}"
+        type: ECC
+        curve: secp384r1
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Create the gateway CA signing request
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "{{ gateway_pki_ca_key }}"
+        common_name: ai-sandbox gateway CA
+        organization_name: ai-sandbox
+        basic_constraints: ["CA:TRUE", "pathlen:0"]
+        basic_constraints_critical: true
+        key_usage: [keyCertSign, cRLSign]
+        key_usage_critical: true
+        # The guests trust this CA: it may vouch for the gateway hosts only,
+        # and for no IP address, so its key could not impersonate any other
+        # site to them. A new gateway host re-issues it (same key and subject:
+        # Envoy's certificate still verifies); the guests then need ca_trust.
+        name_constraints_permitted: "{{ gateway_pki_ca_permitted }}"
+        name_constraints_excluded: "{{ gateway_pki_ca_excluded }}"
+        name_constraints_critical: true
+        use_common_name_for_san: false
+      register: gateway_pki_ca_csr
+      changed_when: false
+
+    - name: Self-sign the gateway CA
+      community.crypto.x509_certificate:
+        path: "{{ gateway_pki_ca_cert }}"
+        csr_content: "{{ gateway_pki_ca_csr.csr }}"
+        privatekey_path: "{{ gateway_pki_ca_key }}"
+        provider: selfsigned
+        selfsigned_not_after: "{{ gateway_pki_ca_days }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create Envoy's gateway key (readable by its group)
+      community.crypto.openssl_privatekey:
+        path: "{{ gateway_pki_leaf_key }}"
+        type: ECC
+        curve: secp256r1
+        owner: root
+        group: "{{ gateway_pki_key_group }}"
+        mode: "0640"
+
+    - name: Create Envoy's gateway signing request
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "{{ gateway_pki_leaf_key }}"
+        common_name: ai-sandbox gateway
+        # No IP SAN: the CA may vouch for no address (vars/main.yml).
+        subject_alt_name: "{{ gateway_pki_gateway_hosts | map('regex_replace', '^', 'DNS:') | list }}"
+        basic_constraints: ["CA:FALSE"]
+        key_usage: [digitalSignature, keyEncipherment]
+        extended_key_usage: [serverAuth]
+      register: gateway_pki_leaf_csr
+      changed_when: false
+
+    - name: Sign Envoy's gateway certificate with the gateway CA
+      community.crypto.x509_certificate:
+        path: "{{ gateway_pki_leaf_cert }}"
+        csr_content: "{{ gateway_pki_leaf_csr.csr }}"
+        provider: ownca
+        ownca_path: "{{ gateway_pki_ca_cert }}"
+        ownca_privatekey_path: "{{ gateway_pki_ca_key }}"
+        ownca_not_after: "{{ gateway_pki_leaf_days }}"
+        owner: root
+        group: root
+        mode: "0644"
+      register: gateway_pki_leaf_signed
+
+    - name: Read the gateway CA certificate
+      ansible.builtin.slurp:
+        src: "{{ gateway_pki_ca_cert }}"
+      register: gateway_pki_ca_pem
+
+- name: Export the gateway CA certificate for the guests' CA trust
+  ansible.builtin.copy:
+    content: "{{ gateway_pki_ca_pem.content | b64decode }}"
+    dest: "{{ gateway_pki_ca_export }}"
+    mode: "0644"
+  when: gateway_pki_ready
+
+- name: Issue the upstream-test CA and the upstream MCP server's certificate
+  when: gateway_pki_ready
+  block:
+    - name: Create the upstream-test CA key
+      community.crypto.openssl_privatekey:
+        path: "{{ gateway_pki_upstream_ca_key }}"
+        type: ECC
+        curve: secp384r1
+        mode: "0600"
+
+    - name: Create the upstream-test CA signing request
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "{{ gateway_pki_upstream_ca_key }}"
+        common_name: ai-sandbox upstream-test CA
+        organization_name: ai-sandbox
+        basic_constraints: ["CA:TRUE", "pathlen:0"]
+        basic_constraints_critical: true
+        key_usage: [keyCertSign, cRLSign]
+        key_usage_critical: true
+        # Envoy trusts it for the lab's own upstreams only.
+        name_constraints_permitted: "{{ gateway_pki_upstream_hosts | map('regex_replace', '^', 'DNS:') | list }}"
+        name_constraints_critical: true
+        use_common_name_for_san: false
+      register: gateway_pki_upstream_ca_csr
+      changed_when: false
+
+    - name: Self-sign the upstream-test CA
+      community.crypto.x509_certificate:
+        path: "{{ gateway_pki_upstream_ca_cert }}"
+        csr_content: "{{ gateway_pki_upstream_ca_csr.csr }}"
+        privatekey_path: "{{ gateway_pki_upstream_ca_key }}"
+        provider: selfsigned
+        selfsigned_not_after: "{{ gateway_pki_ca_days }}"
+        mode: "0644"
+
+    - name: Create the upstream MCP server's key
+      community.crypto.openssl_privatekey:
+        path: "{{ gateway_pki_upstream_leaf_key }}"
+        type: ECC
+        curve: secp256r1
+        mode: "0600"
+
+    - name: Create the upstream MCP server's signing request
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "{{ gateway_pki_upstream_leaf_key }}"
+        common_name: "{{ gateway_pki_upstream_hosts | first }}"
+        subject_alt_name: "{{ gateway_pki_upstream_hosts | map('regex_replace', '^', 'DNS:') | list }}"
+        basic_constraints: ["CA:FALSE"]
+        key_usage: [digitalSignature, keyEncipherment]
+        extended_key_usage: [serverAuth]
+      register: gateway_pki_upstream_leaf_csr
+      changed_when: false
+
+    - name: Sign the upstream MCP server's certificate with the upstream-test CA
+      community.crypto.x509_certificate:
+        path: "{{ gateway_pki_upstream_leaf_cert }}"
+        csr_content: "{{ gateway_pki_upstream_leaf_csr.csr }}"
+        provider: ownca
+        ownca_path: "{{ gateway_pki_upstream_ca_cert }}"
+        ownca_privatekey_path: "{{ gateway_pki_upstream_ca_key }}"
+        ownca_not_after: "{{ gateway_pki_leaf_days }}"
+        mode: "0644"
+
+    - name: Install the upstream-test CA certificate for Envoy
+      ansible.builtin.copy:
+        src: "{{ gateway_pki_upstream_ca_cert }}"
+        dest: "{{ gateway_pki_upstream_ca_installed }}"
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the leaf chains to the CA and names every gateway host; the
+# CA key is root-only. Skipped only in a dry run that would create them, or
+# re-sign the certificate (a gateway host was added or removed).
+# ---------------------------------------------------------------------------
+- name: Decide whether Envoy's certificate can be verified
+  ansible.builtin.set_fact:
+    gateway_pki_verifiable: >-
+      {{ gateway_pki_ready and not (ansible_check_mode and gateway_pki_leaf_signed is changed) }}
+
+- name: Verify Envoy's certificate against the gateway CA
+  ansible.builtin.command:
+    argv: [openssl, verify, -CAfile, "{{ gateway_pki_ca_cert }}", "{{ gateway_pki_leaf_cert }}"]
+  register: gateway_pki_verify
+  changed_when: false
+  check_mode: false
+  become: true
+  when: gateway_pki_verifiable
+
+- name: Read Envoy's certificate
+  community.crypto.x509_certificate_info:
+    path: "{{ gateway_pki_leaf_cert }}"
+  register: gateway_pki_leaf_info
+  become: true
+  when: gateway_pki_verifiable
+
+- name: Stat the gateway CA key
+  ansible.builtin.stat:
+    path: "{{ gateway_pki_ca_key }}"
+  register: gateway_pki_ca_key_stat
+  become: true
+  when: gateway_pki_verifiable
+
+- name: Assert the gateway certificate chains, names every gateway host and no IP, and the CA key is root-only
+  ansible.builtin.assert:
+    that:
+      - "gateway_pki_verify.stdout is search(': OK$')"
+      - >-
+        (gateway_pki_gateway_hosts | map('regex_replace', '^', 'DNS:') | list)
+        | difference(gateway_pki_leaf_info.subject_alt_name) | length == 0
+      - gateway_pki_leaf_info.subject_alt_name | select('match', 'IP:') | list | length == 0
+      - gateway_pki_ca_key_stat.stat.pw_name == 'root' and gateway_pki_ca_key_stat.stat.mode == '0600'
+    fail_msg: >-
+      {{ gateway_pki_leaf_cert }}: verify said {{ gateway_pki_verify.stdout }}; SANs
+      {{ gateway_pki_leaf_info.subject_alt_name }}; CA key owner/mode
+      {{ gateway_pki_ca_key_stat.stat.pw_name }}/{{ gateway_pki_ca_key_stat.stat.mode }}
+    success_msg: "{{ gateway_pki_leaf_cert }}: {{ gateway_pki_leaf_info.subject_alt_name | join(', ') }}"
+  when: gateway_pki_verifiable
+...

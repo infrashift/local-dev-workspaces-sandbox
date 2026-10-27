@@ -1,0 +1,20 @@
+# {{ ansible_managed }}
+# The GitHub MCP server {{ upstream_github_mcp_version }} in http mode, on loopback only: stunnel
+# (ai-sandbox-github-mcp-tls.service) is its only way in. It holds no token: each
+# request's Authorization header carries one, which the gateway injected.
+[Unit]
+Description=ai-sandbox GitHub MCP server (http mode) on 127.0.0.1:{{ upstream_github_mcp_backend_port }}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+DynamicUser=yes
+ExecStart={{ upstream_github_mcp_bin }} http --listen-host 127.0.0.1 --port {{ upstream_github_mcp_backend_port }}{{ ' --read-only' if upstream_github_mcp_read_only else '' }}
+Restart=on-failure
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

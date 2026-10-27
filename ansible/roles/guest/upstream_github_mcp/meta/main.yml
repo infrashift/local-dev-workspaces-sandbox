@@ -1,0 +1,19 @@
+---
+galaxy_info:
+  author: infrashift
+  description: The GitHub MCP server in http mode behind stunnel TLS, the gateway's self-hosted remote MCP upstream
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Fedora
+      versions:
+        - "44"
+  galaxy_tags:
+    - mcp
+    - github
+    - testing
+    - fedora
+
+dependencies: []
+...

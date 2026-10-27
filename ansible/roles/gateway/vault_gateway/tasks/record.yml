@@ -1,0 +1,37 @@
+---
+# One surrogate's Vault record and its non-secret metadata (concepts/Surrogate
+# Credential Model).
+#   vault_gateway_s, vault_gateway_header, vault_gateway_value, vault_gateway_record_id
+- name: "Ensure the record for {{ vault_gateway_surrogate.key }}"
+  ansible.builtin.include_tasks: ensure.yml
+  vars:
+    vault_gateway_object:
+      path: "{{ vault_gateway_kv_mount }}/data/surrogates/{{ vault_gateway_record_id }}"
+      data:
+        target_hosts: "{{ vault_gateway_s.target_hosts | join(',') }}"
+        repo: "{{ vault_gateway_s.repo | default('') }}"
+        header: "{{ vault_gateway_header }}"
+        value: "{{ vault_gateway_value }}"
+      kv: true
+      secret: true
+
+# The binding again, without the secret: what the operator token reads. The
+# fingerprint is the first 16 hex digits of the value's SHA-256, enough to
+# tell a rotation or a surrogate-valued record apart, too short to test
+# guesses against. Vault refuses an empty custom_metadata value, so a
+# surrogate bound to no repository has no repo key.
+- name: "Ensure the metadata for {{ vault_gateway_surrogate.key }}"
+  ansible.builtin.include_tasks: ensure.yml
+  vars:
+    vault_gateway_object:
+      path: "{{ vault_gateway_kv_mount }}/metadata/surrogates/{{ vault_gateway_record_id }}"
+      data:
+        custom_metadata: >-
+          {{ {'target_hosts': vault_gateway_s.target_hosts | join(','),
+              'header': vault_gateway_header,
+              'scheme': vault_gateway_s.scheme,
+              'value_fingerprint': (vault_gateway_value | hash('sha256'))[:16]}
+             | combine({'repo': vault_gateway_s.repo} if vault_gateway_s.repo is defined else {}) }}
+      kv: false
+      secret: true
+...

@@ -1,0 +1,41 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries are asserted against their prerequisites rather than assumed.
+neovim_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+neovim_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS — not caller-settable.
+#
+# Neovim names its assets x86_64 / arm64, so the architecture is translated
+# here and nowhere else.
+# ---------------------------------------------------------------------------
+neovim_home: "{{ ansible_facts['user_dir'] }}"
+neovim_arch: "{{ {'aarch64': 'arm64', 'x86_64': 'x86_64'}[ansible_facts['architecture']] }}"
+neovim_tarball: "nvim-linux-{{ neovim_arch }}.tar.gz"
+neovim_download_url: "https://github.com/neovim/neovim/releases/download/v{{ neovim_version }}/{{ neovim_tarball }}"
+
+# Not ~/.local/share/nvim: that is Neovim's own stdpath('data'), where plugins
+# and parsers live. The distribution gets a directory of its own, versioned so
+# an upgrade replaces it wholesale rather than extracting over the old tree.
+neovim_install_root: "{{ neovim_home }}/.local/share/nvim-dist"
+neovim_install_dir: "{{ neovim_install_root }}/{{ neovim_version }}"
+neovim_bin: "{{ neovim_home }}/.local/bin/nvim"
+
+# SHA-256 digests pinned per version, per asset architecture, from the digests
+# GitHub records for each release asset, matched against the release's own
+# shasum.txt (carried over from trusted-devcontainer-templates).
+neovim_pinned_checksums:
+  "0.12.5":
+    x86_64: "bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875"
+    arm64: "1aa5ca085249580ae0f91eb14f27ec0919773ff2d99a163d03f3d6c21ac29725"
+
+neovim_effective_checksum: >-
+  {{ neovim_checksum if neovim_checksum | length > 0
+     else neovim_pinned_checksums.get(neovim_version, {}).get(neovim_arch, '') }}
+...

@@ -1,0 +1,45 @@
+---
+sandbox_user_egress_compatibility_list:
+  - fedora44
+sandbox_user_egress_variant: >-
+  {{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS — not caller-settable.
+# ---------------------------------------------------------------------------
+sandbox_user_egress_home: "{{ ansible_facts['user_dir'] }}"
+sandbox_user_egress_proxy_url: "http://{{ sandbox_user_egress_gateway_ip }}:{{ sandbox_user_egress_proxy_port }}"
+# Java's nonProxyHosts separator is '|'; everyone else's is ','.
+sandbox_user_egress_non_proxy: "{{ (['localhost', '127.0.0.1'] + sandbox_user_egress_gateway_hosts) | join('|') }}"
+sandbox_user_egress_marker: "# {mark} ai-sandbox gateway proxy (Ansible managed)"
+sandbox_user_egress_java_opts: >-
+  -Dhttp.proxyHost={{ sandbox_user_egress_gateway_ip }} -Dhttp.proxyPort={{ sandbox_user_egress_proxy_port }}
+  -Dhttps.proxyHost={{ sandbox_user_egress_gateway_ip }} -Dhttps.proxyPort={{ sandbox_user_egress_proxy_port }}
+  -Dhttp.nonProxyHosts={{ sandbox_user_egress_non_proxy }}
+# file -> the block written into it.
+sandbox_user_egress_blocks:
+  - path: "{{ sandbox_user_egress_home }}/.npmrc"
+    marker: "{{ sandbox_user_egress_marker }}"
+    block: |
+      proxy={{ sandbox_user_egress_proxy_url }}
+      https-proxy={{ sandbox_user_egress_proxy_url }}
+      noproxy={{ (['localhost', '127.0.0.1'] + sandbox_user_egress_gateway_hosts) | join(',') }}
+  - path: "{{ sandbox_user_egress_home }}/.cargo/config.toml"
+    marker: "{{ sandbox_user_egress_marker }}"
+    block: |
+      [http]
+      proxy = "{{ sandbox_user_egress_proxy_url }}"
+  - path: "{{ sandbox_user_egress_home }}/.gradle/gradle.properties"
+    marker: "{{ sandbox_user_egress_marker }}"
+    block: |
+      systemProp.http.proxyHost={{ sandbox_user_egress_gateway_ip }}
+      systemProp.http.proxyPort={{ sandbox_user_egress_proxy_port }}
+      systemProp.https.proxyHost={{ sandbox_user_egress_gateway_ip }}
+      systemProp.https.proxyPort={{ sandbox_user_egress_proxy_port }}
+      systemProp.http.nonProxyHosts={{ sandbox_user_egress_non_proxy }}
+  - path: "{{ sandbox_user_egress_home }}/.bashrc.d/ai-sandbox-java.sh"
+    marker: "{{ sandbox_user_egress_marker }}"
+    block: |
+      export JAVA_TOOL_OPTIONS='{{ sandbox_user_egress_java_opts }}'
+sandbox_user_egress_m2_settings: "{{ sandbox_user_egress_home }}/.m2/settings.xml"
+...

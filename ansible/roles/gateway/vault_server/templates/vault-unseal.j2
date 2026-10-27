@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# vault-unseal <vault-socket> <unseal-key-file>: wait for Vault to answer on
+# its socket, then unseal it if it is sealed. The key is sent on curl's stdin,
+# never argv.
+set -euo pipefail
+SOCK="$1"
+KEY_FILE="$2"
+vault() { curl -s --unix-socket "$SOCK" "$@"; }
+for _ in $(seq 60); do
+  code="$(vault -o /dev/null -w '%{http_code}' http://localhost/v1/sys/health || true)"
+  # 200 unsealed, 503 sealed, 501 not initialised.
+  case "$code" in
+    200) exit 0 ;;
+    503) break ;;
+    501) echo "Vault is not initialised: run make -f lab-gateway.mk gateway" >&2; exit 1 ;;
+  esac
+  sleep 1
+done
+printf '{"key":"%s"}' "$(cat "$KEY_FILE")" \
+  | vault -f -X PUT --data @- http://localhost/v1/sys/unseal | grep -q '"sealed":false'

@@ -1,0 +1,184 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries are asserted against their prerequisites rather than assumed.
+lazyvim_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+lazyvim_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS
+# ---------------------------------------------------------------------------
+# The user lane connects as guest_user, so the facts describe that account.
+# Each upstream names its assets differently; lazyvim_tools translates
+# lazyvim_arch per tool.
+lazyvim_home: "{{ ansible_facts['user_dir'] }}"
+lazyvim_arch: "{{ {'aarch64': 'arm64', 'x86_64': 'amd64'}[ansible_facts['architecture']] }}"
+
+# The neovim role links nvim into ~/.local/bin. This role asserts it is there
+# and names the role to apply when it is not.
+lazyvim_nvim: "{{ lazyvim_home }}/.local/bin/nvim"
+lazyvim_bin_dir: "{{ lazyvim_home }}/.local/bin"
+lazyvim_config_dir: "{{ lazyvim_home }}/.config/nvim"
+# lazy.nvim's root: stdpath('data')/lazy
+lazyvim_plugin_dir: "{{ lazyvim_home }}/.local/share/nvim/lazy"
+
+# The lockfile this role installs from, read once so each plugin's commit can
+# be checked against what is on disk. Regenerate it in
+# trusted-devcontainer-templates (`make lazy-lock`) and copy it here.
+lazyvim_lock: "{{ lookup('ansible.builtin.file', role_path ~ '/files/nvim/lazy-lock.json') | from_json }}"
+lazyvim_lazy_nvim_repo: https://github.com/folke/lazy.nvim.git
+
+# The language extras this role supports: parameter value -> the Lua modules it
+# imports. files/extras.json is the one trusted-devcontainer-templates'
+# update-lazy-lock.sh resolves the lockfile over -- so the lockfile covers every
+# extra, and a guest installs only the plugins its own lazyvim_extras name.
+lazyvim_extras_supported: "{{ lookup('ansible.builtin.file', role_path ~ '/files/extras.json') | from_json }}"
+lazyvim_extras_list: "{{ lazyvim_extras.split(',') | map('trim') | select | list }}"
+
+# The CLIs LazyVim would otherwise install through Mason. Each upstream names
+# its assets differently, so lazyvim_arch is translated per tool here and
+# nowhere else. `pattern` is matched against the tool's own version output,
+# anchored so one version cannot pass for another that it prefixes.
+lazyvim_tools:
+  - name: tree-sitter
+    version: "{{ lazyvim_tree_sitter_version }}"
+    asset: "tree-sitter-cli-linux-{{ {'amd64': 'x64', 'arm64': 'arm64'}[lazyvim_arch] }}.zip"
+    url_base: "https://github.com/tree-sitter/tree-sitter/releases/download/v{{ lazyvim_tree_sitter_version }}"
+    format: zip
+    checksum: >-
+      {{ lazyvim_tree_sitter_checksum if lazyvim_tree_sitter_checksum | length > 0
+         else lazyvim_tree_sitter_pinned_checksums.get(lazyvim_tree_sitter_version, {}).get(lazyvim_arch, '') }}
+    pattern: "^tree-sitter {{ lazyvim_tree_sitter_version | regex_escape }}(\\s|$)"
+  - name: stylua
+    version: "{{ lazyvim_stylua_version }}"
+    asset: "stylua-linux-{{ {'amd64': 'x86_64', 'arm64': 'aarch64'}[lazyvim_arch] }}.zip"
+    url_base: "https://github.com/JohnnyMorganz/StyLua/releases/download/v{{ lazyvim_stylua_version }}"
+    format: zip
+    checksum: >-
+      {{ lazyvim_stylua_checksum if lazyvim_stylua_checksum | length > 0
+         else lazyvim_stylua_pinned_checksums.get(lazyvim_stylua_version, {}).get(lazyvim_arch, '') }}
+    pattern: "^stylua {{ lazyvim_stylua_version | regex_escape }}$"
+  - name: shfmt
+    version: "{{ lazyvim_shfmt_version }}"
+    asset: "shfmt_v{{ lazyvim_shfmt_version }}_linux_{{ lazyvim_arch }}"
+    url_base: "https://github.com/mvdan/sh/releases/download/v{{ lazyvim_shfmt_version }}"
+    format: binary
+    checksum: >-
+      {{ lazyvim_shfmt_checksum if lazyvim_shfmt_checksum | length > 0
+         else lazyvim_shfmt_pinned_checksums.get(lazyvim_shfmt_version, {}).get(lazyvim_arch, '') }}
+    pattern: "^v{{ lazyvim_shfmt_version | regex_escape }}$"
+
+# SHA256 digests pinned per version, per architecture, from the digests GitHub
+# records for each release asset. A version/arch pair that is absent resolves
+# to '' and is caught by the checksum assert in tasks/main.yml.
+lazyvim_tree_sitter_pinned_checksums:
+  "0.27.0":
+    amd64: "e4a3826bcd0fe099ee3a5617767374939cbc23c4a35b5b53f5fc04142525a2c1"
+    arm64: "6260b621bf5ab87027dfb463bf955504ef32cdcda62b81f28447753e48c83a62"
+lazyvim_stylua_pinned_checksums:
+  "2.5.2":
+    amd64: "bcb0d855e91f102f28a370e850f8566b3b44b79e6274d806ea5246837c0fd5ab"
+    arm64: "0ef2ebf0b7e5a652b65c4cb96c6d9ffb3981a98547de3c764465bbf54a8d761a"
+lazyvim_shfmt_pinned_checksums:
+  "3.14.1":
+    amd64: "76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf"
+    arm64: "5f2db09dae91fca848f7adbdd014632e921a383863a2ad7e0450ad3aba0c6489"
+
+# Lua run by headless Neovim. Each prints one marker line so the result can be
+# picked out of whatever else plugins write to stdout while starting.
+#
+# Build the parsers the probe found missing, then report what happened. Rendered
+# with the pending list (a Lua table literal -- {"go","bash"}; to_json's
+# ["go","bash"] is a Lua syntax error that headless Neovim prints and ignores).
+#
+# install() is asynchronous; :wait() blocks until it returns, so Neovim cannot
+# exit halfway through (which is what `+qa' alone would do). force: only missing
+# parsers are passed, and a parser whose .so is gone but whose install record
+# survived would otherwise be skipped as already installed.
+#
+# THE REPORT (1.2.1). A cold CI build lost the largest parsers (bash, tsx,
+# typescript, vim) with the build step "succeeding" in 61 s, and the cause was
+# unknowable: nvim-treesitter keeps its log in memory and echoes it, so a
+# download or `tree-sitter build' error never reached the job log. After
+# :wait() returns this prints one verdict line -- install()'s own result, the
+# seconds it took, and which wanted parsers are not installed AT THAT MOMENT --
+# then nvim-treesitter's whole log (log.show(), captured with nvim_exec2) between
+# markers. The log is shared by every installer in this Neovim, LazyVim's
+# startup install included, so it shows both. A parser missing at return with
+# an `error' line failed to build; one missing with `Compiling parser' and no
+# outcome was still being built when install() returned.
+#
+# THE WAIT (1.2.3). The report named the cause on gcloud-dc's 1-core runners
+# (2026-10-09, three builds alike): `ok=false seconds=60 missing_at_return=vim',
+# and vim's only log lines are ONE download and `Compiling parser'. LazyVim's
+# treesitter config installs every missing parser when the plugin loads, in this
+# same Neovim, and it got to vim first. nvim-treesitter (main f603a2f4,
+# install_lang) lets a second install of a language that one is already
+# building wait at most INSTALL_TIMEOUT (60 s), then return false. vim is the
+# one parser whose `tree-sitter build' outlasts that on one core; when this
+# command ended, Neovim exited and took the unfinished build with it. So
+# install() is called again with the parsers still missing, each call waiting
+# out the build in progress, until none is missing. An attempt that fails in
+# under 55 s cannot be that wait (it always lasts the whole 60 s): the parser
+# failed on its own, and calling again would only repeat it. 1800 s bounds all
+# attempts together. `attempts' in the report counts the calls.
+lazyvim_lua_build_parsers: >-
+  local ts = require('nvim-treesitter')
+  local t0 = vim.uv.hrtime()
+  local want = { {{ lazyvim_parsers_pending | map('to_json') | join(', ') }} }
+  local function missing()
+  local have = {}
+  for _, l in ipairs(ts.get_installed('parsers')) do have[l] = true end
+  return vim.tbl_filter(function(l) return not have[l] end, want)
+  end
+  local ok, attempts, gone = false, 0, want
+  repeat
+  attempts = attempts + 1
+  local a0 = vim.uv.hrtime()
+  ok = ts.install(gone, { force = true }):wait(1800000)
+  local took = (vim.uv.hrtime() - a0) / 1e9
+  gone = missing()
+  until #gone == 0 or took < 55 or (vim.uv.hrtime() - t0) / 1e9 > 1800
+  local secs = (vim.uv.hrtime() - t0) / 1e9
+  local log = vim.api.nvim_exec2("lua require('nvim-treesitter.log').show()", { output = true }).output
+  io.stdout:write(("\nPARSERS_INSTALLED ok=%s seconds=%.0f wanted=%d attempts=%d missing_at_return=%s\n"):format(
+  tostring(ok), secs, #want, attempts, table.concat(gone, ",")))
+  io.stdout:write("\nTS_LOG_BEGIN\n" .. log .. "\nTS_LOG_END\n")
+
+# The parsers LazyVim wants (core plus the Go extra) that it would install at
+# startup. This asks LazyVim.treesitter.have() -- the exact test LazyVim runs
+# before it downloads a parser -- rather than looking for a parser .so on the
+# runtimepath: Neovim bundles a few parsers (vim, lua, c, ...) that nvim-
+# treesitter does not count as installed, and LazyVim would fetch those on the
+# first start. Only "LazyVim would install nothing" means nothing is fetched.
+lazyvim_lua_missing_parsers: >-
+  LazyVim.treesitter.get_installed(true)
+  local want = LazyVim.opts("nvim-treesitter").ensure_installed or {}
+  local missing = vim.tbl_filter(function(lang)
+    return not LazyVim.treesitter.have(lang)
+  end, want)
+  table.sort(missing)
+  io.stdout:write("\nMISSING_PARSERS=" .. vim.json.encode(missing) .. "\n")
+# Plugins lazy.nvim knows about that are not on disk.
+lazyvim_lua_missing_plugins: >-
+  local missing = {}
+  for _, p in ipairs(require("lazy").plugins()) do
+    if not p._.installed then table.insert(missing, p.name) end
+  end
+  table.sort(missing)
+  io.stdout:write("\nMISSING_PLUGINS=" .. vim.json.encode(missing) .. "\n")
+
+# The plugins the rendered spec names -- core, the chosen extras, the
+# developer's own lua/plugins/ -- which is exactly what lazy.nvim installs. The
+# pin checks walk THIS list, not the whole lockfile: the lockfile also covers
+# extras this guest did not ask for, whose plugins are absent by design.
+lazyvim_lua_spec_plugins: >-
+  local names = {}
+  for _, p in ipairs(require("lazy").plugins()) do table.insert(names, p.name) end
+  table.sort(names)
+  io.stdout:write("\nSPEC_PLUGINS=" .. vim.json.encode(names) .. "\n")
+...

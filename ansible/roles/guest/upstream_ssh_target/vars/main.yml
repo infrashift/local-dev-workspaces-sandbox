@@ -1,0 +1,13 @@
+---
+upstream_ssh_target_compatibility_list:
+  - fedora44
+upstream_ssh_target_variant: >-
+  {{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}
+
+# ---------------------------------------------------------------------------
+# ROLE CONSTANTS
+# ---------------------------------------------------------------------------
+upstream_ssh_target_ca_file: /etc/ssh/ai-sandbox-user-ca.pub
+upstream_ssh_target_principals_dir: /etc/ssh/auth_principals
+upstream_ssh_target_sshd_config: /etc/ssh/sshd_config.d/40-ai-sandbox-user-ca.conf
+...

@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+# Vault's audit log (vault_gateway's file audit device). HUP makes Vault
+# reopen it; the audit device fails closed, so the new file must be writable.
+{{ vault_server_audit_dir }}/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0600 {{ vault_server_user }} {{ vault_server_user }}
+    postrotate
+        systemctl reload vault.service >/dev/null 2>&1 || true
+    endscript
+}

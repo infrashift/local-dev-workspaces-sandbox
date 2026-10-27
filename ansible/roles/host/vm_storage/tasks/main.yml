@@ -1,0 +1,84 @@
+---
+# images/: downloaded, read-only base images (backing files every overlay
+# reads). pools/<lab>/: the lab's libvirt storage pool, where libvirtd
+# creates the VM overlays and seed ISOs. Both live outside $HOME because the
+# QEMU processes run as libvirt-qemu, which cannot traverse a 0750 home.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - vm_storage_images_dir is defined and vm_storage_images_dir is match('^/[^ ]+$')
+      - vm_storage_pools_dir is defined and vm_storage_pools_dir is match('^/[^ ]+$')
+      - vm_storage_lab_name is defined and vm_storage_lab_name is match('^[a-z0-9][a-z0-9_-]*$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        vm_storage_images_dir    absolute path without spaces (lab-config.mk IMAGES_DIR)
+        vm_storage_pools_dir     absolute path without spaces (lab-config.mk POOLS_DIR)
+        vm_storage_lab_name      lowercase letters, digits, '_' and '-' (the lab directory name)
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "{{ vm_storage_images_dir }}, {{ vm_storage_lab_pool_dir }} (owner {{ vm_storage_owner }})"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+# 0755 and world-readable images: libvirt-qemu reads the backing files.
+- name: Create VM storage directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ vm_storage_owner }}"
+    mode: "0755"
+  loop: "{{ vm_storage_dirs }}"
+  become: true
+
+# ---------------------------------------------------------------------------
+# VERIFICATION
+# ---------------------------------------------------------------------------
+- name: Stat the VM storage directories
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ vm_storage_dirs }}"
+  register: vm_storage_stat
+  when: not ansible_check_mode
+
+- name: Assert that every VM storage directory exists, is the operator's and is world-traversable
+  ansible.builtin.assert:
+    that:
+      - item.stat.isdir and item.stat.writeable
+      - item.stat.pw_name == vm_storage_owner
+      - item.stat.roth and item.stat.xoth
+    fail_msg: "{{ item.item }} is not a directory {{ vm_storage_owner }} can write and others can traverse"
+    quiet: true
+  loop: "{{ vm_storage_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+...

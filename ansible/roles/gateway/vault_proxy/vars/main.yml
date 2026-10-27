@@ -1,0 +1,15 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none.
+# ---------------------------------------------------------------------------
+vault_proxy_user: vault-proxy
+# systemd-analyze security's score for vault-proxy.service when its sandboxing was set.
+vault_proxy_max_exposure: 1.1
+# Every API call goes to Vault's unix socket; the URL's host is a placeholder.
+vault_proxy_vault_url: http://localhost
+vault_proxy_config: "{{ vault_proxy_config_dir }}/proxy.hcl"
+vault_proxy_role_id_file: "{{ vault_proxy_config_dir }}/role_id"
+vault_proxy_secret_id_file: "{{ vault_proxy_config_dir }}/secret_id"
+vault_proxy_unit: /etc/systemd/system/vault-proxy.service
+...

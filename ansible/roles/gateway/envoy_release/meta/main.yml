@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  author: infrashift
+  description: The Envoy proxy binary from a GPG-verified GitHub release on the Linux x86_64 host
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - envoy
+    - proxy
+    - linux
+
+dependencies: []
+...

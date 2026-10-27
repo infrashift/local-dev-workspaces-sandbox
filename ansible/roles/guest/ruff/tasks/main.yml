@@ -1,0 +1,191 @@
+---
+# Astral's ruff, from the release tarball, verified against a pinned SHA-256,
+# into ~/.local/share/ruff-dist/<version> with ruff linked into ~/.local/bin.
+#
+# The source feature installed ruff with `uv tool install`, which verifies
+# nothing against a pin. The release tarball is hash-pinned exactly like uv's,
+# and needs no uv.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - ruff_variant in ruff_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      ruff supports {{ ruff_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ ruff_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Assert that the play names the account it provisions
+  ansible.builtin.assert:
+    that: guest_user is defined and guest_user is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: "Set guest_user (the account this user-lane role installs for) at the play level."
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: ruff_whoami
+  changed_when: false
+  check_mode: false
+
+# Everything lands in this account's home, so it must be the account running
+# the role -- files are then owned correctly by construction, with no become,
+# owner/group or chown. Facts must come from the same account: the home
+# directory is read from them.
+- name: Assert that the role runs in the user lane, as guest_user
+  ansible.builtin.assert:
+    that:
+      - ruff_whoami.stdout == guest_user
+      - ansible_facts['user_id'] == guest_user
+    fail_msg: >-
+      ruff installs into {{ guest_user }}'s home and must run as that account: apply
+      it from a play that connects as guest_user without become (it ran as
+      {{ ruff_whoami.stdout }}; facts were gathered as {{ ansible_facts['user_id'] }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+#
+#   mandatory     ruff_version
+#   pass-through  ruff_checksum: must be DEFINED, may be empty -- empty means
+#                 "use the pinned map", so only absence is a wiring bug.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - ruff_version is defined and ruff_version is match('^\d+\.\d+\.\d+$')
+      - ruff_checksum is defined
+      - ruff_checksum | length == 0 or ruff_checksum is match('^[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        ruff_version   X.Y.Z
+        ruff_checksum  '' to use the role's pinned map, or the 64-hex SHA-256 of
+                       {{ ruff_tarball }} for a version the map does not pin
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "ruff {{ ruff_version }} ({{ ruff_platform }})"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Check the installed ruff version
+  ansible.builtin.command: "{{ ruff_bin_dir }}/ruff --version"
+  register: ruff_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# `ruff --version` prints "ruff 0.17.2". Anchor on the end of the line so
+# one version cannot pass for another it prefixes.
+- name: Decide whether to install ruff {{ ruff_version }}
+  ansible.builtin.set_fact:
+    ruff_install_required: >-
+      {{ ruff_installed.rc != 0 or (ruff_installed.stdout | trim) is not match(ruff_version_pattern) }}
+
+# A resolved-empty checksum means get_url would SKIP verification, not fail it.
+- name: "Assert that a checksum is available: ruff {{ ruff_version }}"
+  ansible.builtin.assert:
+    that: ruff_effective_checksum is match('^[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      No SHA-256 is pinned for {{ ruff_tarball }} at ruff {{ ruff_version }}. Pass
+      ruff_checksum to install a version or platform the role's map does not pin.
+    quiet: true
+  when: ruff_install_required
+
+- name: Would download, SHA-256 verify and install ruff {{ ruff_version }}
+  ansible.builtin.debug:
+    msg: "{{ ruff_download_url }} -> {{ ruff_install_dir }}"
+  changed_when: true
+  when: ruff_install_required and ansible_check_mode
+
+- name: Install ruff {{ ruff_version }}
+  when: ruff_install_required and not ansible_check_mode
+  block:
+    - name: Create a scratch directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -ruff
+      register: ruff_tmp
+
+    - name: Download the ruff tarball (verified against the pinned SHA-256)
+      ansible.builtin.get_url:
+        url: "{{ ruff_download_url }}"
+        dest: "{{ ruff_tmp.path }}/{{ ruff_tarball }}"
+        checksum: "sha256:{{ ruff_effective_checksum }}"
+        mode: "0644"
+        timeout: 120
+
+    # A version change replaces the whole tree rather than extracting over it.
+    - name: Remove any previously installed ruff
+      ansible.builtin.file:
+        path: "{{ ruff_install_root }}"
+        state: absent
+
+    - name: Create the ruff install directory
+      ansible.builtin.file:
+        path: "{{ ruff_install_dir }}"
+        state: directory
+        mode: "0755"
+
+    # The tarball's single top-level directory is named after the platform.
+    - name: Extract ruff
+      ansible.builtin.unarchive:
+        src: "{{ ruff_tmp.path }}/{{ ruff_tarball }}"
+        dest: "{{ ruff_install_dir }}"
+        remote_src: true
+        extra_opts:
+          - --strip-components=1
+
+  always:
+    - name: Remove the scratch directory
+      ansible.builtin.file:
+        path: "{{ ruff_tmp.path }}"
+        state: absent
+      when: ruff_tmp.path is defined
+
+- name: Ensure ~/.local/bin exists
+  ansible.builtin.file:
+    path: "{{ ruff_bin_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Link ruff into ~/.local/bin
+  ansible.builtin.file:
+    src: "{{ ruff_install_dir }}/{{ item }}"
+    dest: "{{ ruff_bin_dir }}/{{ item }}"
+    state: link
+    force: true
+  loop: [ruff]
+  when: not (ansible_check_mode and ruff_install_required)
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the REQUESTED version, not merely a binary that runs.
+# Skipped only in a dry run that would install.
+# ---------------------------------------------------------------------------
+- name: Verify the installed ruff version
+  ansible.builtin.command: "{{ ruff_bin_dir }}/ruff --version"
+  register: ruff_verify
+  changed_when: false
+  check_mode: false
+  when: not (ansible_check_mode and ruff_install_required)
+
+- name: "Assert that the requested version is installed: ruff {{ ruff_version }}"
+  ansible.builtin.assert:
+    that: (ruff_verify.stdout | trim) is match(ruff_version_pattern)
+    fail_msg: "Expected ruff {{ ruff_version }}; {{ ruff_bin_dir }}/ruff reported: {{ ruff_verify.stdout }}"
+    success_msg: "{{ ruff_verify.stdout | trim }}"
+  when: not (ansible_check_mode and ruff_install_required)
+...

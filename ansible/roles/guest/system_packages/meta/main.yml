@@ -1,0 +1,24 @@
+---
+# Ported from: labs/fedora44min-aarch64-dev-ws/ansible/playbooks/site.yml (inline tasks)
+galaxy_info:
+  author: infrashift
+  description: dnf Python bindings, an optional upgrade, and a package list for Fedora and EL guests
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Fedora
+      versions:
+        - "44"
+    - name: EL
+      versions:
+        - "9"
+        - "10"
+  galaxy_tags:
+    - packages
+    - dnf
+    - fedora
+    - rhel
+
+dependencies: []
+...

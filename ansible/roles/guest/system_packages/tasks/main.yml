@@ -1,0 +1,133 @@
+---
+# The guest's package baseline: the dnf Python bindings Ansible's package
+# module needs, an optional full upgrade, then the requested packages.
+#
+# Run after ca_trust: on a guest behind a TLS-intercepting proxy, dnf cannot
+# reach a repository until the proxy's CA is trusted. This is also why
+# cloud-init no longer installs the bindings on first boot.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - system_packages_variant in system_packages_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      system_packages supports {{ system_packages_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ system_packages_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: system_packages_whoami
+  changed_when: false
+  check_mode: false
+
+- name: Assert that the role runs in the system lane
+  ansible.builtin.assert:
+    that: system_packages_whoami.stdout == 'root'
+    fail_msg: >-
+      system_packages writes system state and must run as root: apply it from a play with
+      become: true (it ran as {{ system_packages_whoami.stdout }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+#
+# Booleans arrive as the STRING "true"/"false" when passed with -e; assert
+# membership and apply `| bool` at the point of use.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - system_packages_list is defined and system_packages_list is sequence and system_packages_list is not string
+      - system_packages_list | length > 0
+      - system_packages_list | reject('match', '^[A-Za-z0-9][A-Za-z0-9._+-]*$') | list | length == 0
+      - system_packages_upgrade is defined and (system_packages_upgrade | string | lower) in ['true', 'false']
+      - ansible_facts['pkg_mgr'] in system_packages_bindings
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        system_packages_list     non-empty list of package names
+        system_packages_upgrade  true | false: upgrade every installed package first
+      (and the guest's package manager, {{ ansible_facts['pkg_mgr'] }}, must be one of
+      {{ system_packages_bindings.keys() | list | join(', ') }})
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      {{ system_packages_list | length }} packages via {{ ansible_facts['pkg_mgr'] }};
+      upgrade={{ system_packages_upgrade | bool }}
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+# The package module imports these bindings, so they are installed with the
+# package manager's own CLI, gated on rpm for idempotency.
+# The package module cannot report on the bindings it needs to import.
+- name: "Check for the package module's Python bindings: {{ system_packages_binding }}"
+  ansible.builtin.command: rpm -q {{ system_packages_binding }}  # noqa: command-instead-of-module
+  register: system_packages_binding_rpm
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Would install the bindings, then the packages: {{ system_packages_binding }}"
+  ansible.builtin.debug:
+    msg: "{{ system_packages_dnf }} install {{ system_packages_binding }}; then {{ system_packages_list | join(' ') }}"
+  changed_when: true
+  when: system_packages_binding_rpm.rc != 0 and ansible_check_mode
+
+- name: Install {{ system_packages_binding }}
+  ansible.builtin.command: "{{ system_packages_dnf }} -y install {{ system_packages_binding }}"
+  changed_when: true
+  when: system_packages_binding_rpm.rc != 0 and not ansible_check_mode
+
+# In a dry run without the bindings the package module cannot even plan; the
+# debug task above has reported what the real run will do.
+- name: Upgrade, install and verify the packages
+  when: system_packages_binding_rpm.rc == 0 or not ansible_check_mode
+  block:
+    - name: Upgrade all packages
+      ansible.builtin.package:
+        name: "*"
+        state: latest  # noqa: package-latest
+      when: system_packages_upgrade | bool
+
+    - name: Install the requested packages
+      ansible.builtin.package:
+        name: "{{ system_packages_list }}"
+        state: present
+      register: system_packages_installed
+
+    # -----------------------------------------------------------------------
+    # VERIFICATION — skipped in a dry run that would install something.
+    # -----------------------------------------------------------------------
+    - name: Query every requested package
+      ansible.builtin.command:
+        argv: "{{ ['rpm', '-q', '--whatprovides'] + system_packages_list }}"
+      register: system_packages_rpm
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: not (ansible_check_mode and system_packages_installed is changed)
+
+    - name: Assert that every requested package is installed
+      ansible.builtin.assert:
+        that: system_packages_rpm.rc == 0
+        fail_msg: >-
+          Not installed:
+          {{ system_packages_rpm.stdout_lines | select('search', 'no package provides|is not installed') | list }}
+        success_msg: "{{ system_packages_list | length }} packages installed"
+      when: not (ansible_check_mode and system_packages_installed is changed)
+...

@@ -1,0 +1,66 @@
+# {{ ansible_managed }}
+[Unit]
+Description=HashiCorp Consul (ai-sandbox, loopback only)
+Documentation=https://developer.hashicorp.com/consul/docs
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty={{ consul_server_config }}
+
+[Service]
+# Not notify: a lone server joins no cluster, so Consul never reports READY.
+# consul_server waits for a leader instead.
+Type=exec
+User={{ consul_server_user }}
+Group={{ consul_server_user }}
+# The socket's group: membership lets Consul hand the socket to it.
+SupplementaryGroups={{ consul_server_socket_group }}
+# The socket's directory. Its default ACL gives every socket created in it to
+# the operators as well (rw: a unix socket needs write to connect); the group
+# and other entries are spelled out so the socket's 0660 is what applies.
+RuntimeDirectory={{ consul_server_socket | dirname | basename }}
+RuntimeDirectoryMode=0755
+ExecStartPre=+/usr/bin/setfacl -m d:u::rw,d:g::rw,d:o::-{% for user in consul_server_operators %},d:u:{{ user }}:rw{% endfor %} {{ consul_server_socket | dirname }}
+ExecStart={{ consul_server_bin }} agent -config-dir={{ consul_server_config_dir }}
+ExecReload=/bin/kill --signal HUP $MAINPID
+KillMode=process
+KillSignal=SIGTERM
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+# Sandboxing: systemd-analyze security scores it, and the role asserts that score.
+ProtectSystem=strict
+ReadWritePaths={{ consul_server_data_dir }}
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+KeyringMode=private
+DevicePolicy=closed
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+MemoryDenyWriteExecute=yes
+# The HTTP API's socket, loopback RPC and gossip, and netlink for the
+# interface lookups its address templates make.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+IPAddressAllow=localhost
+IPAddressDeny=any
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

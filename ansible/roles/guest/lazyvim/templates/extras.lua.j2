@@ -1,0 +1,21 @@
+-- ~/.config/nvim/lua/config/extras.lua
+-- Rendered by the ai-sandbox 'lazyvim' role from its lazyvim_extras parameter
+-- ({{ lazyvim_extras }}). Edits are overwritten on the next playbook run.
+--
+-- One import per language extra. `lang.*` are LazyVim's own; `infrashift.*`
+-- are shipped by this role under lua/infrashift/extras/.
+--
+-- The python extra reads these when its spec loads, which is after this file
+-- (lazy.lua requires it before lazy.nvim's setup). python_lsp={{ lazyvim_python_lsp }}:
+-- pyrefly comes from the 'pyrefly' role, basedpyright from 'python_tools',
+-- ruff from 'ruff'. Harmless without lang.python.
+vim.g.lazyvim_python_lsp = "{{ lazyvim_python_lsp }}"
+vim.g.lazyvim_python_ruff = "ruff"
+
+return {
+{% for x in lazyvim_extras_list %}
+{% for m in lazyvim_extras_supported[x] %}
+  { import = "{{ m }}" },
+{% endfor %}
+{% endfor %}
+}

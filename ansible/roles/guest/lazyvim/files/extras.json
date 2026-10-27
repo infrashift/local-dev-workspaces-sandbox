@@ -1,0 +1,7 @@
+{
+  "lang.go": ["lazyvim.plugins.extras.lang.go"],
+  "lang.python": ["lazyvim.plugins.extras.lang.python"],
+  "lang.java": ["lazyvim.plugins.extras.lang.java", "infrashift.extras.java"],
+  "infrashift.cue": ["infrashift.extras.cue"],
+  "infrashift.ansible_lint": ["infrashift.extras.ansible_lint"]
+}

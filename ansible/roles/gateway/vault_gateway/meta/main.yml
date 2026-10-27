@@ -1,0 +1,20 @@
+---
+galaxy_info:
+  author: infrashift
+  description: >-
+    Vault for the zero-trust gateway (surrogate KV, policies, AppRole, SSH CA, operator token) on the
+    Linux x86_64 host
+  company: infrashift.sh
+  license: MIT
+  min_ansible_version: "2.21"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - vault
+    - hashicorp
+    - linux
+
+dependencies: []
+...

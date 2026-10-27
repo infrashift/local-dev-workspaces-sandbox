@@ -1,0 +1,7 @@
+# {{ ca_trust_environment_d }}
+# {{ ansible_managed }} (ai-sandbox ca_trust role); edits are overwritten.
+# Read by systemd user managers (rootless podman's socket, user services),
+# which never source /etc/profile.d.
+{% for k, v in ca_trust_env.items() %}
+{{ k }}={{ v }}
+{% endfor %}

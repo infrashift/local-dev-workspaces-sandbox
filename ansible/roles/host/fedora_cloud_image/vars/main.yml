@@ -1,0 +1,18 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none. The names follow Fedora's
+# release layout and change only if Fedora changes it.
+# ---------------------------------------------------------------------------
+fedora_cloud_image_file: >-
+  Fedora-Cloud-Base-Generic-{{ fedora_cloud_image_release }}-{{ fedora_cloud_image_respin
+  }}.{{ fedora_cloud_image_arch }}.qcow2
+fedora_cloud_image_checksum_file: >-
+  Fedora-Cloud-{{ fedora_cloud_image_release }}-{{ fedora_cloud_image_respin }}-{{ fedora_cloud_image_arch }}-CHECKSUM
+fedora_cloud_image_base_url: >-
+  https://download.fedoraproject.org/pub/fedora/linux/releases/{{ fedora_cloud_image_release
+  }}/Cloud/{{ fedora_cloud_image_arch }}/images
+# The keyring only supplies candidate keys; the signature is accepted only from
+# the pinned fedora_cloud_image_key_fpr.
+fedora_cloud_image_key_url: https://fedoraproject.org/fedora.gpg
+...

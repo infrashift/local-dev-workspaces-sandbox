@@ -1,0 +1,10 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none.
+# ---------------------------------------------------------------------------
+sandbox_firewall_table: ai_sandbox
+sandbox_firewall_packages: [nftables]
+sandbox_firewall_rules: /etc/ai-sandbox/nftables.nft
+sandbox_firewall_unit: /etc/systemd/system/ai-sandbox-firewall.service
+...

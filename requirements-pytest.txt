@@ -1,0 +1,16 @@
+# Python tooling for the verification suites (.pytest/ at the project root),
+# which lab-bootstrap-verify.mk, lab-gateway-verify.mk and
+# lab-provision-verify.mk run.
+#
+# Kept apart from requirements.txt so the test tools never change the Ansible
+# virtual environment. After changing any pin, regenerate the hashed lock
+# with `make -f lab-bootstrap-verify.mk lock` and commit both files.
+
+# Test runner
+pytest==9.1.1
+
+# Host fixtures for pytest: the local backend for the host, ssh for the guests
+pytest-testinfra==10.2.2
+
+# Reads the playbooks and group_vars, the sources of truth the tests check against
+PyYAML==6.0.3

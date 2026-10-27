@@ -1,0 +1,153 @@
+-- {{ ansible_managed }}
+-- The surrogate swap on Envoy's TLS gateway (concepts/Surrogate Credential
+-- Model). For a request to a gateway route:
+--   no credential       pass through if the route is anonymous, else 401
+--   a credential        look up base64url(credential) in Vault, through Vault
+--                       Proxy's unix socket:
+--     unknown           403 (a real credential smuggled into the guest is
+--                       refused too: only surrogates pass)
+--     host not bound    403 "surrogate host mismatch" (anti-replay)
+--     repo not bound    403 "surrogate repository mismatch": the record names
+--                       a repository, the route a repo_path pattern, and the
+--                       path names another repository (a path the pattern
+--                       does not match, /user or /graphql, passes: the
+--                       fine-grained PAT behind it limits that itself)
+--     bound             drop the surrogate header, inject the real one
+-- Records are written by the gateway playbook (vault_gateway), which keeps
+-- their fields to [^"\\] so the string matching below is exact.
+local VAULT_CLUSTER = "vault_proxy"
+local RECORD_PATH = "/v1/{{ envoy_gateway_kv_mount }}/data/surrogates/"
+local LOOKUP_TIMEOUT_MS = 2000
+
+local function respond(handle, status, body, extra)
+  local headers = { [":status"] = tostring(status), ["content-type"] = "text/plain" }
+  for name, value in pairs(extra or {}) do
+    headers[name] = value
+  end
+  handle:respond(headers, "ai-sandbox gateway: " .. body .. "\n")
+end
+
+-- base64 -> base64url without padding: the record id alphabet.
+local function to_id(b64)
+  return (b64:gsub("%+", "-"):gsub("/", "_"):gsub("=+$", ""))
+end
+
+-- The lookup id of the request's credential, nil if it carries none, or
+-- nil plus an error for a credential this gateway cannot read.
+local function credential_id(handle, headers)
+  local auth = headers:get("authorization")
+  if auth then
+    local basic = auth:match("^[Bb]asic%s+([A-Za-z0-9+/=]+)%s*$")
+    if basic then
+      return to_id(basic)
+    end
+    local token = auth:match("^[Bb]earer%s+(%S+)%s*$") or auth:match("^[Tt]oken%s+(%S+)%s*$")
+    if token then
+      return to_id(handle:base64Escape(token))
+    end
+    return nil, "unsupported authorization scheme"
+  end
+  local key = headers:get("x-api-key")
+  if key then
+    return to_id(handle:base64Escape(key))
+  end
+  return nil
+end
+
+local function field(body, name)
+  return body:match('"' .. name .. '"%s*:%s*"([^"]*)"')
+end
+
+-- The swap itself. httpCall yields, and every object taken from the handle
+-- before it (the header map, the route metadata) is invalid after it: read
+-- everything needed first.
+local function swap(handle)
+  local meta = handle:metadata()
+  if meta:get("gateway") == nil then
+    return
+  end
+  local anonymous, pattern = meta:get("anonymous"), meta:get("repo_path")
+  local headers = handle:headers()
+  local host = (headers:get(":authority") or ""):gsub(":%d+$", ""):lower()
+  local path = headers:get(":path") or ""
+
+  local id, err = credential_id(handle, headers)
+  if err then
+    respond(handle, 400, err)
+    return
+  end
+  if id == nil then
+    if anonymous then
+      return
+    end
+    respond(handle, 401, host .. " needs a surrogate credential",
+      { ["www-authenticate"] = 'Basic realm="ai-sandbox gateway"' })
+    return
+  end
+
+  local record_headers, body = handle:httpCall(VAULT_CLUSTER, {
+    [":method"] = "GET",
+    [":path"] = RECORD_PATH .. id,
+    [":authority"] = "vault-proxy",
+  }, nil, LOOKUP_TIMEOUT_MS)
+  local status = record_headers[":status"]
+  if status == "404" then
+    handle:logWarn("gateway: unknown credential for " .. host)
+    respond(handle, 403, "unknown or revoked surrogate")
+    return
+  end
+  if status ~= "200" or body == nil then
+    handle:logErr("gateway: Vault lookup failed with status " .. tostring(status))
+    respond(handle, 502, "surrogate lookup failed")
+    return
+  end
+
+  local hosts, name, value = field(body, "target_hosts"), field(body, "header"), field(body, "value")
+  if not (hosts and name and value) then
+    handle:logErr("gateway: malformed surrogate record " .. id)
+    respond(handle, 500, "malformed surrogate record")
+    return
+  end
+  local bound = false
+  for bound_host in hosts:gmatch("[^,]+") do
+    if bound_host == host then
+      bound = true
+    end
+  end
+  if not bound then
+    handle:logWarn("gateway: surrogate presented to " .. host .. ", bound to " .. hosts)
+    respond(handle, 403, "surrogate host mismatch")
+    return
+  end
+
+  local repo = field(body, "repo") or ""
+  if repo ~= "" and pattern then
+    local owner, repo_name = path:match(pattern)
+    if owner then
+      local requested = (owner .. "/" .. repo_name:gsub("%.git$", "")):lower()
+      if requested ~= repo:lower() then
+        handle:logWarn("gateway: surrogate for " .. repo .. " presented for " .. requested .. " on " .. host)
+        respond(handle, 403, "surrogate repository mismatch")
+        return
+      end
+    end
+  end
+
+  -- httpCall yields: a header map taken before it is no longer valid.
+  headers = handle:headers()
+  headers:remove("authorization")
+  headers:remove("x-api-key")
+  headers:replace(name, value)
+  handle:logInfo("gateway: injected " .. name .. " for " .. host)
+end
+
+-- Fail closed: Envoy lets a request through unchanged when the script
+-- raises, which would hand the surrogate to the upstream with no swap and
+-- no binding checked.
+function envoy_on_request(handle)
+  local ok, err = pcall(swap, handle)
+  if not ok then
+    handle:logErr("gateway: refused after a filter error: " .. tostring(err))
+    respond(handle, 500, "gateway filter error")
+  end
+end

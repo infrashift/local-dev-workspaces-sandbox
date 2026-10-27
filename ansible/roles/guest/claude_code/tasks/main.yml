@@ -1,0 +1,312 @@
+---
+# Claude Code as Anthropic's native binary -- no Node, npm or bun -- with the
+# same layout `claude install` creates:
+#
+#   ~/.local/share/claude/versions/<version>   the binary
+#   ~/.local/bin/claude                        symlink to it
+#
+# The binary is verified against the SHA-256 in that version's manifest.json
+# from downloads.claude.ai, the source `curl https://claude.ai/install.sh`
+# itself trusts.
+#
+# A channel (stable | latest) is resolved to a concrete version FIRST, then
+# compared with what is installed: comparing against the channel name would
+# let any old build satisfy it forever. A pinned X.Y.Z turns the binary's
+# background auto-updater off, which would otherwise replace the pinned
+# version; a channel leaves it on.
+#
+# Claude Code is a Node-style runtime: to accept the ai-sandbox gateway's
+# certificate for api.anthropic.com it needs NODE_EXTRA_CA_CERTS, which the
+# ca_trust role sets for login shells.
+#
+# MCP servers the playbook names are registered at user scope, in
+# ~/.claude.json (what `claude mcp add --scope user` writes).
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - claude_code_variant in claude_code_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      claude_code supports {{ claude_code_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ claude_code_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Assert that the play names the account it provisions
+  ansible.builtin.assert:
+    that: guest_user is defined and guest_user is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: "Set guest_user (the account this user-lane role installs for) at the play level."
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: claude_code_whoami
+  changed_when: false
+  check_mode: false
+
+# Everything lands in this account's home, so it must be the account running
+# the role -- files are then owned correctly by construction, with no become,
+# owner/group or chown. Facts must come from the same account: the home
+# directory is read from them.
+- name: Assert that the role runs in the user lane, as guest_user
+  ansible.builtin.assert:
+    that:
+      - claude_code_whoami.stdout == guest_user
+      - ansible_facts['user_id'] == guest_user
+    fail_msg: >-
+      claude_code installs into {{ guest_user }}'s home and must run as that account: apply
+      it from a play that connects as guest_user without become (it ran as
+      {{ claude_code_whoami.stdout }}; facts were gathered as {{ ansible_facts['user_id'] }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - claude_code_version is defined and claude_code_version is match('^(stable|latest|\d+\.\d+\.\d+)$')
+      - claude_code_environment is defined and claude_code_environment is mapping
+      # SHAPE VALIDATION: rendered into a shell file every login sources.
+      - claude_code_environment.keys() | reject('match', '^[A-Z][A-Z0-9_]*$') | list | length == 0
+      - >-
+        claude_code_environment.values() | map('string') | reject('match', '^[A-Za-z0-9._:/@=,+-]*$')
+        | list | length == 0
+      - claude_code_mcp_servers is defined and claude_code_mcp_servers is mapping
+      - claude_code_mcp_servers.keys() | reject('match', '^[a-z][a-z0-9-]*$') | list | length == 0
+      - >-
+        claude_code_mcp_servers.values() | map(attribute='type', default='') | reject('in', ['stdio', 'http'])
+        | list | length == 0
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass:
+        claude_code_version      stable | latest (a release channel, auto-update on)
+                                 or X.Y.Z (a pinned release, auto-update off)
+        claude_code_environment  {NAME: value} exported for Claude Code (may be empty): letters,
+                                 digits and . _ : / @ = , + - only (e.g. a surrogate API key)
+        claude_code_mcp_servers  {name: server} user-scope MCP servers (may be empty), as Claude
+                                 Code stores them: {type: stdio, command, args, env} or
+                                 {type: http, url, headers}; names lowercase, digits and -
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "claude-code {{ claude_code_version }} ({{ claude_code_platform }})"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+# Read-only lookup; it runs in a dry run too, so the dry run can say exactly
+# which version it would install.
+- name: "Resolve the release channel to a version: {{ claude_code_version }}"
+  ansible.builtin.uri:
+    url: "{{ claude_code_base_url }}/{{ claude_code_version }}"
+    return_content: true
+    timeout: 30
+  register: claude_code_channel
+  check_mode: false
+  when: not claude_code_pinned
+
+- name: Record the Claude Code version to install
+  ansible.builtin.set_fact:
+    claude_code_target: "{{ claude_code_version if claude_code_pinned else claude_code_channel.content | trim }}"
+
+- name: Assert that the channel resolved to a release version
+  ansible.builtin.assert:
+    that: claude_code_target is match('^\d+\.\d+\.\d+$')
+    fail_msg: >-
+      {{ claude_code_base_url }}/{{ claude_code_version }} did not return a version
+      (got '{{ claude_code_target | truncate(80) }}').
+    quiet: true
+
+- name: Check the installed Claude Code version
+  ansible.builtin.command: "{{ claude_code_bin_dir }}/claude --version"
+  register: claude_code_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# `claude --version` prints "2.1.308 (Claude Code)": anchor on the space.
+- name: Decide whether to install Claude Code {{ claude_code_target }}
+  ansible.builtin.set_fact:
+    claude_code_install_required: >-
+      {{ claude_code_installed.rc != 0
+         or (claude_code_installed.stdout | trim) is not match('^' ~ (claude_code_target | regex_escape) ~ ' ') }}
+
+- name: Would download, SHA-256 verify and install Claude Code {{ claude_code_target }}
+  ansible.builtin.debug:
+    msg: >-
+      {{ claude_code_base_url }}/{{ claude_code_target }}/{{ claude_code_platform }}/claude
+      -> {{ claude_code_binary }}
+  changed_when: true
+  when: claude_code_install_required and ansible_check_mode
+
+- name: Install Claude Code {{ claude_code_target }}
+  when: claude_code_install_required and not ansible_check_mode
+  block:
+    # The manifest cannot verify itself; it is fetched over TLS from the same
+    # origin as the binary, exactly as install.sh does.
+    - name: Fetch the release manifest for {{ claude_code_target }}
+      ansible.builtin.uri:
+        url: "{{ claude_code_base_url }}/{{ claude_code_target }}/manifest.json"
+        return_content: true
+        timeout: 30
+      register: claude_code_manifest
+
+    - name: Read the checksum from the manifest for {{ claude_code_platform }}
+      ansible.builtin.set_fact:
+        claude_code_checksum: >-
+          {{ claude_code_manifest.json.get('platforms', {}).get(claude_code_platform, {}).get('checksum', '') }}
+
+    # A resolved-empty checksum means get_url would SKIP verification, not fail it.
+    - name: "Assert that the manifest lists this platform and version: {{ claude_code_target }}"
+      ansible.builtin.assert:
+        that:
+          - claude_code_manifest.json.version == claude_code_target
+          - claude_code_checksum is match('^[0-9a-f]{64}$')
+        fail_msg: >-
+          {{ claude_code_base_url }}/{{ claude_code_target }}/manifest.json is for version
+          {{ claude_code_manifest.json.version }} and has no SHA-256 for {{ claude_code_platform }}
+          ('{{ claude_code_checksum }}').
+        quiet: true
+
+    - name: Create the Claude Code versions directory
+      ansible.builtin.file:
+        path: "{{ claude_code_versions_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Download, verified against the manifest SHA-256: Claude Code {{ claude_code_target }}"
+      ansible.builtin.get_url:
+        url: "{{ claude_code_base_url }}/{{ claude_code_target }}/{{ claude_code_platform }}/claude"
+        dest: "{{ claude_code_binary }}"
+        checksum: "sha256:{{ claude_code_checksum }}"
+        mode: "0755"
+        timeout: 300
+
+- name: Ensure ~/.local/bin exists
+  ansible.builtin.file:
+    path: "{{ claude_code_bin_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Link claude into ~/.local/bin
+  ansible.builtin.file:
+    src: "{{ claude_code_binary }}"
+    dest: "{{ claude_code_bin_dir }}/claude"
+    state: link
+    force: true
+  when: not (ansible_check_mode and claude_code_install_required)
+
+# ~/.bashrc.d/ is how a Fedora/EL user's ~/.bashrc takes drop-ins. Without
+# that loop the setting below would be written and silently never read.
+- name: Read ~/.bashrc
+  ansible.builtin.slurp:
+    src: "{{ claude_code_home }}/.bashrc"
+  register: claude_code_bashrc
+
+- name: Assert that ~/.bashrc reads ~/.bashrc.d/
+  ansible.builtin.assert:
+    that: claude_code_bashrc.content | b64decode is search('\.bashrc\.d')
+    fail_msg: >-
+      {{ claude_code_home }}/.bashrc does not source ~/.bashrc.d/*, so {{ claude_code_env_file }}
+      would never be read. Restore the distribution's /etc/skel/.bashrc loop.
+    quiet: true
+
+- name: Ensure ~/.bashrc.d exists
+  ansible.builtin.file:
+    path: "{{ claude_code_env_file | dirname }}"
+    state: directory
+    mode: "0700"
+
+- name: Write Claude Code's environment (the pinned version's auto-updater off, the playbook's variables)
+  ansible.builtin.copy:
+    dest: "{{ claude_code_env_file }}"
+    content: |
+      # {{ claude_code_env_file }} -- written by the ai-sandbox claude_code role.
+      # Change these in the playbook, not here.
+      {% if claude_code_pinned %}
+      # Claude Code is pinned to {{ claude_code_version }}; its background updater
+      # would replace it.
+      export DISABLE_AUTOUPDATER=1
+      {% endif %}
+      {% for name, value in claude_code_environment | dictsort %}
+      export {{ name }}='{{ value }}'
+      {% endfor %}
+    mode: "0644"
+  when: claude_code_pinned or claude_code_environment | length > 0
+
+- name: "Leave the auto-updater on for the channel: {{ claude_code_version }}"
+  ansible.builtin.file:
+    path: "{{ claude_code_env_file }}"
+    state: absent
+  when: not claude_code_pinned and claude_code_environment | length == 0
+
+# ~/.claude.json also holds Claude Code's own state: only the mcpServers
+# entries named here are set. Every other key, and a server added by hand, is
+# kept; key order is kept too, so a re-run writes nothing.
+- name: Read ~/.claude.json
+  ansible.builtin.slurp:
+    src: "{{ claude_code_config }}"
+  register: claude_code_config_raw
+  failed_when: false
+
+- name: Register the MCP servers in ~/.claude.json
+  ansible.builtin.copy:
+    content: "{{ claude_code_config_merged | to_nice_json(indent=2, sort_keys=False) }}\n"
+    dest: "{{ claude_code_config }}"
+    mode: "0600"
+  vars:
+    claude_code_config_current: >-
+      {{ (claude_code_config_raw.content | b64decode | from_json)
+         if claude_code_config_raw.content is defined else {} }}
+    claude_code_config_merged: >-
+      {{ claude_code_config_current | combine({'mcpServers': (claude_code_config_current.mcpServers | default({}))
+         | combine(claude_code_mcp_servers)}) }}
+  when: claude_code_mcp_servers | length > 0
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the REQUESTED version, and the MCP servers. Skipped only in
+# a dry run that would install or register.
+# ---------------------------------------------------------------------------
+- name: Verify the installed Claude Code version
+  ansible.builtin.command: "{{ claude_code_bin_dir }}/claude --version"
+  register: claude_code_verify
+  changed_when: false
+  check_mode: false
+  when: not (ansible_check_mode and claude_code_install_required)
+
+- name: "Assert that the requested version is installed: Claude Code {{ claude_code_target }}"
+  ansible.builtin.assert:
+    that: (claude_code_verify.stdout | trim) is match('^' ~ (claude_code_target | regex_escape) ~ ' ')
+    fail_msg: >-
+      Expected Claude Code {{ claude_code_target }}; claude --version reported: {{ claude_code_verify.stdout }}
+    success_msg: "{{ claude_code_verify.stdout | trim }}"
+  when: not (ansible_check_mode and claude_code_install_required)
+- name: Read the registered MCP servers back
+  ansible.builtin.slurp:
+    src: "{{ claude_code_config }}"
+  register: claude_code_config_verify
+  when: claude_code_mcp_servers | length > 0 and not ansible_check_mode
+
+- name: Assert that every MCP server is registered as the playbook gives it
+  ansible.builtin.assert:
+    that: >-
+      (claude_code_config_verify.content | b64decode | from_json).mcpServers[item.key] | default({}) == item.value
+    fail_msg: "{{ claude_code_config }} does not register the MCP server {{ item.key }} as given"
+    quiet: true
+  loop: "{{ claude_code_mcp_servers | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: claude_code_mcp_servers | length > 0 and not ansible_check_mode
+...

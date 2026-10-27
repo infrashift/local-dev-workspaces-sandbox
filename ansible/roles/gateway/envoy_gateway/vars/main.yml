@@ -1,0 +1,59 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none.
+# ---------------------------------------------------------------------------
+envoy_gateway_user: envoy
+# systemd-analyze security's scores when the units' sandboxing was set. Envoy's
+# is higher: it binds a privileged port, and its LuaJIT needs W+X memory.
+envoy_gateway_max_exposure:
+  envoy: 1.7
+  ai-sandbox-consul-template: 1.1
+envoy_gateway_config_dir: /etc/envoy
+envoy_gateway_config: "{{ envoy_gateway_config_dir }}/envoy.yaml"
+envoy_gateway_lua: "{{ envoy_gateway_config_dir }}/surrogate.lua"
+# consul-template runs as its own user, with its own configuration directory.
+envoy_gateway_ct_user: consul-template
+envoy_gateway_ct_dir: /etc/consul-template
+envoy_gateway_ctmpl: "{{ envoy_gateway_ct_dir }}/connect-routes.ctmpl"
+envoy_gateway_ct_config: "{{ envoy_gateway_ct_dir }}/consul-template.hcl"
+# Where they were while consul-template ran as envoy.
+envoy_gateway_ct_former:
+  - "{{ envoy_gateway_config_dir }}/connect-routes.ctmpl"
+  - "{{ envoy_gateway_config_dir }}/consul-template.hcl"
+envoy_gateway_rds_dir: /var/lib/envoy/rds
+envoy_gateway_rds_file: "{{ envoy_gateway_rds_dir }}/connect.yaml"
+# The admin interface: envoy-only (0600). admin_readonly is a GET-only view of
+# these paths, for the operator and the gateway suite.
+envoy_gateway_runtime_dir: /run/envoy
+# Literal paths: the gateway suite reads them from this file unrendered.
+envoy_gateway_admin_socket: /run/envoy/admin.sock
+envoy_gateway_admin_readonly_socket: /run/envoy/admin-readonly.sock
+envoy_gateway_admin_readonly_paths: [/ready, /server_info, /listeners, /clusters, /stats, /config_dump]
+# IPv4 only, for the tunnel's DNS cache and the gateway's LOGICAL_DNS
+# clusters. V4_PREFERRED falls back to the AAAA record whenever an A lookup
+# comes back empty, and caches it: one DNS hiccup then fails every request to
+# that host (503 UF) on a host without an IPv6 route, until the entry
+# refreshes. The sandbox network is IPv4-only anyway.
+envoy_gateway_dns_lookup_family: V4_ONLY
+# Requests per gateway host: a bucket of `burst`, refilled by `per_second`
+# every second; past it, 429. Generous: a clone, the MCP servers and Claude
+# Code stay far below it.
+envoy_gateway_rate_limit: { burst: 200, per_second: 50 }
+envoy_gateway_kv_mount: ai-sandbox
+envoy_gateway_kv_prefix: ai-sandbox/egress
+# The CA each gateway route's upstream is verified with (vars/gateway.yml ca:).
+# system is the host's public bundle, or, behind a TLS-inspecting proxy, that
+# bundle plus the proxy's chain.
+envoy_gateway_host_ca_bundle: /etc/ssl/certs/ca-certificates.crt
+envoy_gateway_inspection_bundle: /etc/ai-sandbox/tls-inspection/public-upstream-ca.pem
+envoy_gateway_inspecting: "{{ envoy_gateway_inspection_pems | length > 0 }}"
+envoy_gateway_ca_files:
+  system: "{{ envoy_gateway_inspection_bundle if envoy_gateway_inspecting else envoy_gateway_host_ca_bundle }}"
+  upstream: "{{ envoy_gateway_pki_dir }}/upstream-ca.pem"
+envoy_gateway_cert: "{{ envoy_gateway_pki_dir }}/gateway.pem"
+envoy_gateway_key: "{{ envoy_gateway_pki_dir }}/gateway.key"
+envoy_gateway_units:
+  - { src: envoy.service.j2, dest: /etc/systemd/system/envoy.service }
+  - { src: ai-sandbox-consul-template.service.j2, dest: /etc/systemd/system/ai-sandbox-consul-template.service }
+...

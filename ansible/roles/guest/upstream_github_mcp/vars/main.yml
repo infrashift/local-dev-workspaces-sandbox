@@ -1,0 +1,35 @@
+---
+upstream_github_mcp_compatibility_list:
+  - fedora44
+upstream_github_mcp_variant: >-
+  {{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}
+
+# ---------------------------------------------------------------------------
+# ROLE CONSTANTS
+# ---------------------------------------------------------------------------
+upstream_github_mcp_archive: >-
+  github-mcp-server_Linux_{{ {'aarch64': 'arm64', 'x86_64': 'x86_64'}[ansible_facts['architecture']] }}.tar.gz
+upstream_github_mcp_download_url: >-
+  https://github.com/github/github-mcp-server/releases/download/v{{ upstream_github_mcp_version
+  }}/{{ upstream_github_mcp_archive }}
+upstream_github_mcp_install_root: /usr/local/libexec/ai-sandbox/github-mcp-server
+upstream_github_mcp_install_dir: "{{ upstream_github_mcp_install_root }}/{{ upstream_github_mcp_version }}"
+upstream_github_mcp_bin: "{{ upstream_github_mcp_install_dir }}/github-mcp-server"
+# `--version` prints "Version: 2.0.3" on its own line.
+upstream_github_mcp_version_line: "(?m)^Version: {{ upstream_github_mcp_version | regex_escape }}$"
+# The server speaks plain HTTP on loopback only; stunnel is its only way in.
+upstream_github_mcp_backend_port: 8082
+# Under /etc/stunnel: SELinux confines stunnel (stunnel_t) to files labelled
+# stunnel_etc_t, which this tree is; it cannot read systemd credentials.
+upstream_github_mcp_dir: /etc/stunnel/ai-sandbox-github-mcp
+upstream_github_mcp_cert: "{{ upstream_github_mcp_dir }}/server.pem"
+upstream_github_mcp_key: "{{ upstream_github_mcp_dir }}/server.key"
+upstream_github_mcp_stunnel_conf: /etc/stunnel/ai-sandbox-github-mcp.conf
+# stunnel reads the key as root, then drops to this account.
+upstream_github_mcp_stunnel_user: nobody
+upstream_github_mcp_units:
+  - { src: ai-sandbox-github-mcp.service.j2, dest: /etc/systemd/system/ai-sandbox-github-mcp.service }
+  - { src: ai-sandbox-github-mcp-tls.service.j2, dest: /etc/systemd/system/ai-sandbox-github-mcp-tls.service }
+upstream_github_mcp_packages:
+  - stunnel
+...

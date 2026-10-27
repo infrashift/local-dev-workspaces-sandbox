@@ -1,0 +1,24 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none. The names follow Envoy's
+# GitHub release layout.
+# ---------------------------------------------------------------------------
+envoy_release_label: "envoy {{ envoy_release_version }}"
+envoy_release_base_url: https://github.com/envoyproxy/envoy/releases/download/v{{ envoy_release_version }}
+# Envoy names x86_64 as is, and aarch64 as aarch_64.
+envoy_release_arch_map:
+  x86_64: x86_64
+envoy_release_asset: >-
+  envoy-{{ envoy_release_version }}-linux-{{ envoy_release_arch_map[ansible_facts['architecture']] }}
+# A clearsigned list of every asset's SHA-256.
+envoy_release_sums: checksums.txt.asc
+# The maintainers' key as the release's own tag publishes it. The keyring only
+# supplies candidate keys; the signature is accepted only from the pinned
+# envoy_release_key_fpr.
+envoy_release_key_url: https://raw.githubusercontent.com/envoyproxy/envoy/v{{ envoy_release_version }}/releases.asc
+envoy_release_gpg: /usr/bin/gpg
+envoy_release_gpgv: /usr/bin/gpgv
+# `envoy --version` prints "envoy  version: <sha>/<X.Y.Z>/Clean/RELEASE/BoringSSL".
+envoy_release_version_re: '/{{ envoy_release_version | regex_escape }}/'
+...

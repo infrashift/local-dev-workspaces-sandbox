@@ -1,0 +1,185 @@
+---
+# The Neovim release build, verified against a pinned SHA-256, into
+# ~/.local/share/nvim-dist/<version>, with nvim linked into ~/.local/bin.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - neovim_variant in neovim_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      neovim supports {{ neovim_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ neovim_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Assert that the play names the account it provisions
+  ansible.builtin.assert:
+    that: guest_user is defined and guest_user is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: "Set guest_user (the account this user-lane role installs for) at the play level."
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: neovim_whoami
+  changed_when: false
+  check_mode: false
+
+# Everything lands in this account's home, so it must be the account running
+# the role -- files are then owned correctly by construction, with no become,
+# owner/group or chown. Facts must come from the same account: the home
+# directory is read from them.
+- name: Assert that the role runs in the user lane, as guest_user
+  ansible.builtin.assert:
+    that:
+      - neovim_whoami.stdout == guest_user
+      - ansible_facts['user_id'] == guest_user
+    fail_msg: >-
+      neovim installs into {{ guest_user }}'s home and must run as that account: apply
+      it from a play that connects as guest_user without become (it ran as
+      {{ neovim_whoami.stdout }}; facts were gathered as {{ ansible_facts['user_id'] }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - neovim_version is defined and neovim_version is match('^\d+\.\d+\.\d+$')
+      - neovim_checksum is defined
+      - neovim_checksum | length == 0 or neovim_checksum is match('^[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        neovim_version   X.Y.Z, without the leading v
+        neovim_checksum  '' to use the role's pinned map, or the 64-hex SHA-256 of
+                         {{ neovim_tarball }} for a version the map does not pin
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "neovim {{ neovim_version }} ({{ neovim_arch }})"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Check the installed Neovim version
+  ansible.builtin.command: "{{ neovim_bin }} --version"
+  register: neovim_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Compare the whole first line, not a substring: "NVIM v0.12.5" contains
+# "0.12.5" but so would a hypothetical "NVIM v0.12.50".
+- name: Decide whether to install Neovim {{ neovim_version }}
+  ansible.builtin.set_fact:
+    neovim_install_required: >-
+      {{ neovim_installed.rc != 0
+         or (neovim_installed.stdout_lines + ['']) | first != 'NVIM v' ~ neovim_version }}
+
+# A resolved-empty checksum means get_url would SKIP verification, not fail it.
+- name: "Assert that a checksum is available: Neovim {{ neovim_version }}"
+  ansible.builtin.assert:
+    that: neovim_effective_checksum is match('^[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      No SHA-256 is pinned for Neovim {{ neovim_version }} on {{ neovim_arch }}.
+      Pass neovim_checksum to install a version the role's map does not pin.
+    quiet: true
+  when: neovim_install_required
+
+- name: Would download, SHA-256 verify and install Neovim {{ neovim_version }}
+  ansible.builtin.debug:
+    msg: "{{ neovim_download_url }} -> {{ neovim_install_dir }}"
+  changed_when: true
+  when: neovim_install_required and ansible_check_mode
+
+- name: Install Neovim {{ neovim_version }}
+  when: neovim_install_required and not ansible_check_mode
+  block:
+    - name: Create a scratch directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -neovim
+      register: neovim_tmp
+
+    - name: Download the Neovim release tarball (verified against the pinned SHA-256)
+      ansible.builtin.get_url:
+        url: "{{ neovim_download_url }}"
+        dest: "{{ neovim_tmp.path }}/{{ neovim_tarball }}"
+        checksum: "sha256:{{ neovim_effective_checksum }}"
+        mode: "0644"
+        timeout: 120
+
+    # A version change replaces the whole distribution tree. Extracting a new
+    # release over an old one would leave the old runtime files behind.
+    - name: Remove any previously installed Neovim distribution
+      ansible.builtin.file:
+        path: "{{ neovim_install_root }}"
+        state: absent
+
+    - name: Create the Neovim install directory
+      ansible.builtin.file:
+        path: "{{ neovim_install_dir }}"
+        state: directory
+        mode: "0755"
+
+    # The tarball's single top-level directory is named after the asset
+    # (nvim-linux-arm64/), so strip it: the layout then does not depend on the arch.
+    - name: Extract the Neovim distribution
+      ansible.builtin.unarchive:
+        src: "{{ neovim_tmp.path }}/{{ neovim_tarball }}"
+        dest: "{{ neovim_install_dir }}"
+        remote_src: true
+        extra_opts:
+          - --strip-components=1
+
+  always:
+    - name: Remove the scratch directory
+      ansible.builtin.file:
+        path: "{{ neovim_tmp.path }}"
+        state: absent
+      when: neovim_tmp.path is defined
+
+- name: Ensure ~/.local/bin exists
+  ansible.builtin.file:
+    path: "{{ neovim_home }}/.local/bin"
+    state: directory
+    mode: "0755"
+
+- name: Link nvim into ~/.local/bin
+  ansible.builtin.file:
+    src: "{{ neovim_install_dir }}/bin/nvim"
+    dest: "{{ neovim_bin }}"
+    state: link
+    force: true
+  when: not (ansible_check_mode and neovim_install_required)
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — `nvim --version` opens with exactly "NVIM v<version>".
+# Skipped only in a dry run that would install.
+# ---------------------------------------------------------------------------
+- name: Verify the installed Neovim version
+  ansible.builtin.command: "{{ neovim_bin }} --version"
+  register: neovim_verify
+  changed_when: false
+  check_mode: false
+  when: not (ansible_check_mode and neovim_install_required)
+
+- name: "Assert that the requested version is installed: Neovim {{ neovim_version }}"
+  ansible.builtin.assert:
+    that: neovim_verify.stdout_lines | first == 'NVIM v' ~ neovim_version
+    fail_msg: "Expected 'NVIM v{{ neovim_version }}'; installed nvim reported: {{ neovim_verify.stdout_lines | first }}"
+    success_msg: "Neovim {{ neovim_version }} installed and verified."
+  when: not (ansible_check_mode and neovim_install_required)
+...

@@ -1,0 +1,185 @@
+---
+# ansible-lint with `uv tool install` into ~/.local/share/uv/tools, entry point
+# in ~/.local/bin. Needs the uv role, and an interpreter the guest already has.
+# ansible-lint brings its own ansible-core in its tool venv; nothing here
+# touches the system python.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - ansible_tools_variant in ansible_tools_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      ansible_tools supports {{ ansible_tools_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ ansible_tools_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Assert that the play names the account it provisions
+  ansible.builtin.assert:
+    that: guest_user is defined and guest_user is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: "Set guest_user (the account this user-lane role installs for) at the play level."
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: ansible_tools_whoami
+  changed_when: false
+  check_mode: false
+
+# Everything lands in this account's home, so it must be the account running
+# the role -- files are then owned correctly by construction, with no become,
+# owner/group or chown. Facts must come from the same account: the home
+# directory is read from them.
+- name: Assert that the role runs in the user lane, as guest_user
+  ansible.builtin.assert:
+    that:
+      - ansible_tools_whoami.stdout == guest_user
+      - ansible_facts['user_id'] == guest_user
+    fail_msg: >-
+      ansible_tools installs into {{ guest_user }}'s home and must run as that account: apply
+      it from a play that connects as guest_user without become (it ran as
+      {{ ansible_tools_whoami.stdout }}; facts were gathered as {{ ansible_facts['user_id'] }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - ansible_tools_ansible_lint_version is defined and ansible_tools_ansible_lint_version is match('^\d+\.\d+\.\d+$')
+      - ansible_tools_python_version is defined and ansible_tools_python_version is match('^\d+\.\d+$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        ansible_tools_ansible_lint_version  X.Y.Z (PyPI)
+        ansible_tools_python_version  X.Y: the interpreter the tool's virtualenv runs on;
+            it must already be installed (uv is told never to download one)
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "ansible-lint {{ ansible_tools_ansible_lint_version }} on python {{ ansible_tools_python_version }}"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS — userland only. Everything lands under ~/.local.
+# ---------------------------------------------------------------------------
+- name: Look for uv
+  ansible.builtin.stat:
+    path: "{{ ansible_tools_uv }}"
+  register: ansible_tools_uv_stat
+
+- name: Assert that uv is available
+  ansible.builtin.assert:
+    that: ansible_tools_uv_stat.stat.exists
+    fail_msg: >-
+      ansible-lint installs with `uv tool install`, and found no uv at {{ ansible_tools_uv }}.
+      Apply the uv role earlier in the same play.
+    quiet: true
+  when: not ansible_check_mode
+
+# In a dry run the uv role may only have reported that it would install uv.
+- name: "Would install, once uv is installed: ansible-lint {{ ansible_tools_ansible_lint_version }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ ansible_tools_uv }} tool install --python {{ ansible_tools_python_version }}
+      ansible-lint=={{ ansible_tools_ansible_lint_version }}
+  changed_when: true
+  when: not ansible_tools_uv_stat.stat.exists
+
+- name: Install and verify ansible-lint {{ ansible_tools_ansible_lint_version }}
+  when: ansible_tools_uv_stat.stat.exists
+  block:
+    - name: "Check for the interpreter: Python {{ ansible_tools_python_version }}"
+      ansible.builtin.command:
+        argv: ["{{ ansible_tools_uv }}", python, find, "{{ ansible_tools_python_version }}"]
+      environment: "{{ ansible_tools_env }}"
+      register: ansible_tools_python
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Assert that the interpreter exists (uv will not download one)
+      ansible.builtin.assert:
+        that: ansible_tools_python.rc == 0
+        fail_msg: >-
+          No Python {{ ansible_tools_python_version }} is installed, and uv is told never to
+          download one. Fedora 44's system python3 is 3.14; on EL install the
+          matching python3.X package first (e.g. python3.12 on EL 9), or set
+          ansible_tools_python_version to an interpreter the guest has.
+          uv said: {{ ansible_tools_python.stderr | trim }}
+        success_msg: "python {{ ansible_tools_python_version }}: {{ ansible_tools_python.stdout | trim }}"
+
+    # Gate on the version the installed tool reports, not on uv's output: uv
+    # prints "... is already installed" on a no-op, which reads like a change.
+    - name: Check the installed ansible-lint version
+      ansible.builtin.command:
+        argv: ["{{ ansible_tools_bin }}", --version]
+      environment: "{{ ansible_tools_env }}"
+      register: ansible_tools_installed
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Decide whether to install ansible-lint {{ ansible_tools_ansible_lint_version }}
+      ansible.builtin.set_fact:
+        ansible_tools_install_required: >-
+          {{ ansible_tools_installed.rc != 0
+             or ansible_tools_installed.stdout | regex_replace(ansible_tools_ansi_pattern, '')
+                is not search(ansible_tools_version_pattern) }}
+
+    - name: Would install ansible-lint {{ ansible_tools_ansible_lint_version }}
+      ansible.builtin.debug:
+        msg: >-
+          {{ ansible_tools_uv }} tool install --force --python {{ ansible_tools_python_version }}
+          ansible-lint=={{ ansible_tools_ansible_lint_version }}
+      changed_when: true
+      when: ansible_tools_install_required and ansible_check_mode
+
+    - name: "Install with uv tool install: ansible-lint {{ ansible_tools_ansible_lint_version }}"
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_tools_uv }}"
+          - tool
+          - install
+          - --force
+          - --python
+          - "{{ ansible_tools_python_version }}"
+          - "ansible-lint=={{ ansible_tools_ansible_lint_version }}"
+      environment: "{{ ansible_tools_env }}"
+      changed_when: true
+      when: ansible_tools_install_required and not ansible_check_mode
+
+    # -----------------------------------------------------------------------
+    # VERIFICATION — skipped only in a dry run that would install.
+    # -----------------------------------------------------------------------
+    - name: Verify ansible-lint
+      ansible.builtin.command:
+        argv: ["{{ ansible_tools_bin }}", --version]
+      environment: "{{ ansible_tools_env }}"
+      register: ansible_tools_verify
+      changed_when: false
+      check_mode: false
+      when: not (ansible_check_mode and ansible_tools_install_required)
+
+    - name: "Assert that the requested version is installed: ansible-lint {{ ansible_tools_ansible_lint_version }}"
+      ansible.builtin.assert:
+        that:
+          - >-
+            ansible_tools_verify.stdout | regex_replace(ansible_tools_ansi_pattern, '')
+            is search(ansible_tools_version_pattern)
+        fail_msg: >-
+          Expected ansible-lint {{ ansible_tools_ansible_lint_version }}; it reported: {{ ansible_tools_verify.stdout }}
+        success_msg: "{{ ansible_tools_verify.stdout_lines | join('; ') }}"
+      when: not (ansible_check_mode and ansible_tools_install_required)
+...

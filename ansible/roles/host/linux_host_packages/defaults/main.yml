@@ -1,0 +1,10 @@
+---
+# Intentionally empty. This role has NO defaults.
+#
+# Every input is passed explicitly by the playbook that applies the role, whose
+# pin block is the single source of truth. A default here would be a second
+# source of truth that silently wins whenever that wiring is broken, instead
+# of the PARAMETER BRACKET in tasks/main.yml failing by name.
+#
+# Derived values and role constants belong in vars/main.yml.
+...

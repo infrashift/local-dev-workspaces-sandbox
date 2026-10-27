@@ -1,0 +1,40 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries are asserted against their prerequisites rather than assumed.
+jq_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+jq_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS — not caller-settable.
+#
+# jqlang names its assets jq-linux-amd64 / jq-linux-arm64; the architecture is
+# translated here and nowhere else.
+# ---------------------------------------------------------------------------
+jq_home: "{{ ansible_facts['user_dir'] }}"
+jq_bin_dir: "{{ jq_home }}/.local/bin"
+jq_arch: "{{ {'aarch64': 'arm64', 'x86_64': 'amd64'}[ansible_facts['architecture']] }}"
+jq_binary: "jq-linux-{{ jq_arch }}"
+jq_download_url: "https://github.com/jqlang/jq/releases/download/jq-{{ jq_version }}/{{ jq_binary }}"
+jq_install_root: "{{ jq_home }}/.local/share/jq"
+jq_install_dir: "{{ jq_install_root }}/{{ jq_version }}"
+
+# SHA-256 digests pinned per version, per architecture. jqlang publishes no
+# checksums file, so these were computed from the released binaries
+# (carried over from trusted-devcontainer-features).
+jq_pinned_checksums:
+  "1.8.2":
+    amd64: "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f"
+    arm64: "8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309"
+  "1.7.1":
+    amd64: "5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5"
+    arm64: "4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5"
+
+jq_effective_checksum: >-
+  {{ jq_checksum if jq_checksum | length > 0
+     else jq_pinned_checksums.get(jq_version, {}).get(jq_arch, '') }}
+...

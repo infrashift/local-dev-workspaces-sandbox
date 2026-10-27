@@ -1,0 +1,193 @@
+---
+# Astral's uv, from the release tarball, verified against a pinned SHA-256,
+# into ~/.local/share/uv-dist/<version> with uv and uvx linked into
+# ~/.local/bin. Not ~/.local/share/uv: that is uv's own data directory
+# (tools, interpreters).
+#
+# uv ships its own root certificates and ignores the system trust store; the
+# ca_trust role's SSL_CERT_FILE is what makes it trust a TLS-intercepting
+# proxy, in login shells. Roles that run uv set it in their environment.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — keep these at the top of every guest role.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['distribution'] is defined and ansible_facts['architecture'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true (or after setup)."
+    quiet: true
+
+- name: Assert that this guest is a supported variant
+  ansible.builtin.assert:
+    that:
+      - uv_variant in uv_compatibility_list
+      - ansible_facts['architecture'] in ['aarch64', 'x86_64']
+    fail_msg: >-
+      uv supports {{ uv_compatibility_list | join(', ') }} on aarch64/x86_64;
+      this guest is {{ uv_variant }} {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Assert that the play names the account it provisions
+  ansible.builtin.assert:
+    that: guest_user is defined and guest_user is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: "Set guest_user (the account this user-lane role installs for) at the play level."
+    quiet: true
+
+- name: Check which account the role runs as
+  ansible.builtin.command: id -un
+  register: uv_whoami
+  changed_when: false
+  check_mode: false
+
+# Everything lands in this account's home, so it must be the account running
+# the role -- files are then owned correctly by construction, with no become,
+# owner/group or chown. Facts must come from the same account: the home
+# directory is read from them.
+- name: Assert that the role runs in the user lane, as guest_user
+  ansible.builtin.assert:
+    that:
+      - uv_whoami.stdout == guest_user
+      - ansible_facts['user_id'] == guest_user
+    fail_msg: >-
+      uv installs into {{ guest_user }}'s home and must run as that account: apply
+      it from a play that connects as guest_user without become (it ran as
+      {{ uv_whoami.stdout }}; facts were gathered as {{ ansible_facts['user_id'] }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+#
+#   mandatory     uv_version
+#   pass-through  uv_checksum: must be DEFINED, may be empty -- empty means
+#                 "use the pinned map", so only absence is a wiring bug.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - uv_version is defined and uv_version is match('^\d+\.\d+\.\d+$')
+      - uv_checksum is defined
+      - uv_checksum | length == 0 or uv_checksum is match('^[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        uv_version   X.Y.Z
+        uv_checksum  '' to use the role's pinned map, or the 64-hex SHA-256 of
+                     {{ uv_tarball }} for a version the map does not pin
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: "uv {{ uv_version }} ({{ uv_platform }})"
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Check the installed uv version
+  ansible.builtin.command: "{{ uv_bin_dir }}/uv --version"
+  register: uv_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# `uv --version` prints "uv 0.13.5 (<commit> <date>)". Anchor on the space so
+# one version cannot pass for another it prefixes.
+- name: Decide whether to install uv {{ uv_version }}
+  ansible.builtin.set_fact:
+    uv_install_required: >-
+      {{ uv_installed.rc != 0 or (uv_installed.stdout | trim) is not match(uv_version_pattern) }}
+
+# A resolved-empty checksum means get_url would SKIP verification, not fail it.
+- name: "Assert that a checksum is available: uv {{ uv_version }}"
+  ansible.builtin.assert:
+    that: uv_effective_checksum is match('^[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      No SHA-256 is pinned for {{ uv_tarball }} at uv {{ uv_version }}. Pass
+      uv_checksum to install a version or platform the role's map does not pin.
+    quiet: true
+  when: uv_install_required
+
+- name: Would download, SHA-256 verify and install uv {{ uv_version }}
+  ansible.builtin.debug:
+    msg: "{{ uv_download_url }} -> {{ uv_install_dir }}"
+  changed_when: true
+  when: uv_install_required and ansible_check_mode
+
+- name: Install uv {{ uv_version }}
+  when: uv_install_required and not ansible_check_mode
+  block:
+    - name: Create a scratch directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -uv
+      register: uv_tmp
+
+    - name: Download the uv tarball (verified against the pinned SHA-256)
+      ansible.builtin.get_url:
+        url: "{{ uv_download_url }}"
+        dest: "{{ uv_tmp.path }}/{{ uv_tarball }}"
+        checksum: "sha256:{{ uv_effective_checksum }}"
+        mode: "0644"
+        timeout: 120
+
+    # A version change replaces the whole tree rather than extracting over it.
+    - name: Remove any previously installed uv
+      ansible.builtin.file:
+        path: "{{ uv_install_root }}"
+        state: absent
+
+    - name: Create the uv install directory
+      ansible.builtin.file:
+        path: "{{ uv_install_dir }}"
+        state: directory
+        mode: "0755"
+
+    # The tarball's single top-level directory is named after the platform.
+    - name: Extract uv and uvx
+      ansible.builtin.unarchive:
+        src: "{{ uv_tmp.path }}/{{ uv_tarball }}"
+        dest: "{{ uv_install_dir }}"
+        remote_src: true
+        extra_opts:
+          - --strip-components=1
+
+  always:
+    - name: Remove the scratch directory
+      ansible.builtin.file:
+        path: "{{ uv_tmp.path }}"
+        state: absent
+      when: uv_tmp.path is defined
+
+- name: Ensure ~/.local/bin exists
+  ansible.builtin.file:
+    path: "{{ uv_bin_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Link uv and uvx into ~/.local/bin
+  ansible.builtin.file:
+    src: "{{ uv_install_dir }}/{{ item }}"
+    dest: "{{ uv_bin_dir }}/{{ item }}"
+    state: link
+    force: true
+  loop: [uv, uvx]
+  when: not (ansible_check_mode and uv_install_required)
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — the REQUESTED version, not merely a binary that runs.
+# Skipped only in a dry run that would install.
+# ---------------------------------------------------------------------------
+- name: Verify the installed uv version
+  ansible.builtin.command: "{{ uv_bin_dir }}/uv --version"
+  register: uv_verify
+  changed_when: false
+  check_mode: false
+  when: not (ansible_check_mode and uv_install_required)
+
+- name: "Assert that the requested version is installed: uv {{ uv_version }}"
+  ansible.builtin.assert:
+    that: (uv_verify.stdout | trim) is match(uv_version_pattern)
+    fail_msg: "Expected uv {{ uv_version }}; {{ uv_bin_dir }}/uv reported: {{ uv_verify.stdout }}"
+    success_msg: "{{ uv_verify.stdout | trim }}"
+  when: not (ansible_check_mode and uv_install_required)
+...

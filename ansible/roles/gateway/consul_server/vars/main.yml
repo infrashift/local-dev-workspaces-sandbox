@@ -1,0 +1,23 @@
+---
+# ---------------------------------------------------------------------------
+# DERIVED VALUES AND ROLE CONSTANTS. Not caller-settable: defaults/ is
+# reserved for inputs, and this role has none.
+# ---------------------------------------------------------------------------
+consul_server_user: consul
+# systemd-analyze security's score for consul.service when its sandboxing was set.
+consul_server_max_exposure: 1.4
+consul_server_config: "{{ consul_server_config_dir }}/consul.hcl"
+# Every API call goes to the unix socket; the URL's host is a placeholder.
+consul_server_url: http://localhost
+consul_server_encrypt_config: "{{ consul_server_config_dir }}/encrypt.hcl"
+# Consul's own TCP listeners, loopback only: server RPC and LAN gossip.
+consul_server_tcp_ports: ["8300", "8301"]
+# Root-only: the ACL bootstrap (management) token and the agent's own token.
+consul_server_bootstrap_token_file: "{{ consul_server_secrets_dir }}/bootstrap.token"
+consul_server_agent_token_file: "{{ consul_server_secrets_dir }}/agent.token"
+consul_server_gossip_key_file: "{{ consul_server_secrets_dir }}/gossip.key"
+consul_server_agent_policy: ai-sandbox-agent
+consul_server_agent_rules: |
+  node_prefix "" { policy = "write" }
+  service_prefix "" { policy = "read" }
+...

@@ -1,0 +1,26 @@
+---
+# Variants this role supports. Only fedora44 is exercised by a lab today; the
+# EL entries are asserted against their prerequisites rather than assumed.
+tmux_compatibility_list:
+  - fedora44
+  - redhat9
+  - redhat10
+  - rocky9
+  - rocky10
+tmux_variant: "{{ ansible_facts['distribution'] | lower }}{{ ansible_facts['distribution_major_version'] }}"
+
+# ---------------------------------------------------------------------------
+# ROLE CONSTANTS
+# ---------------------------------------------------------------------------
+# ncurses ships infocmp and tput, which dev-session uses to decide whether the
+# client's TERM is usable here and how large to draw the first window.
+# ncurses-base carries the tmux-256color entry tmux.conf asks for.
+tmux_packages:
+  - tmux
+  - ncurses
+  - ncurses-base
+
+tmux_conf_path: /etc/tmux.conf
+tmux_session_bin: /usr/local/bin/dev-session
+tmux_profile_hook: /etc/profile.d/dev-session.sh
+...

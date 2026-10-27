@@ -1,0 +1,414 @@
+---
+# A single-node Vault on loopback for the zero-trust gateway: raft storage,
+# initialised with one key share, and unsealed after every start by
+# ai-sandbox-vault-unseal.service. The unseal key and root token stay in a
+# root-only directory on this host; nothing here ever reaches a guest.
+
+# ---------------------------------------------------------------------------
+# CONTRACT BRACKET — this role configures the Linux x86_64 host itself.
+# ---------------------------------------------------------------------------
+- name: Assert that facts were gathered
+  ansible.builtin.assert:
+    that: ansible_facts['system'] is defined
+    fail_msg: "This role reads ansible_facts; run it from a play with gather_facts: true."
+    quiet: true
+
+- name: Assert this is the Linux x86_64 host, configured locally
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] == 'x86_64'
+      - ansible_connection == 'local'
+    fail_msg: >-
+      ai-sandbox needs the Linux x86_64 host over a local connection (got {{ ansible_facts['system'] }}
+      {{ ansible_facts['architecture'] }}, connection {{ ansible_connection }})
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# PARAMETER BRACKET — this role has NO defaults. The playbook passes every
+# value below, so a missing one fails here, by name, before any work happens.
+# ---------------------------------------------------------------------------
+- name: Assert that every required role parameter was supplied
+  ansible.builtin.assert:
+    that:
+      - vault_server_bin is defined and vault_server_bin is match('^/[^ ]+$')
+      # A unix socket in the unit's RuntimeDirectory (/run/<dir>/): Vault has no TCP listener.
+      - vault_server_socket is defined and vault_server_socket is match('^/run/[a-z][a-z0-9-]*/[^/ ]+\.sock$')
+      - vault_server_socket_group is defined and vault_server_socket_group is match('^[a-z][a-z0-9_-]*$')
+      - vault_server_operators is defined and vault_server_operators is sequence
+      - vault_server_operators is not string
+      - vault_server_operators | reject('match', '^[a-z_][a-z0-9_-]*$') | list | length == 0
+      - vault_server_data_dir is defined and vault_server_data_dir is match('^/[^ ]+$')
+      - vault_server_config_dir is defined and vault_server_config_dir is match('^/[^ ]+$')
+      - vault_server_secrets_dir is defined and vault_server_secrets_dir is match('^/[^ ]+$')
+      - vault_server_audit_dir is defined and vault_server_audit_dir is match('^/[^ ]+$')
+    fail_msg: >-
+      A required role parameter was not supplied. This role has NO defaults by
+      design — the playbook must pass each one:
+        vault_server_bin          absolute path to the vault binary (hashicorp_release)
+        vault_server_socket       /run/<dir>/<name>.sock: the only listener (systemd's RuntimeDirectory)
+        vault_server_socket_group the group services join (SupplementaryGroups) to open the socket
+        vault_server_operators    the users the socket opens to by ACL (the operator, no re-login)
+        vault_server_data_dir     absolute storage directory
+        vault_server_config_dir   absolute configuration directory
+        vault_server_secrets_dir  absolute root-only directory for the unseal key and root token
+        vault_server_audit_dir    absolute vault-only directory for the audit log (rotated daily)
+    quiet: true
+
+- name: Show the requested parameters
+  ansible.builtin.debug:
+    msg: >-
+      Vault on {{ vault_server_socket }} (group {{ vault_server_socket_group }}, operators
+      {{ vault_server_operators | join(', ') }}), data in {{ vault_server_storage_dir }}
+
+# ---------------------------------------------------------------------------
+# ROLE TASKS
+# ---------------------------------------------------------------------------
+- name: Install Vault
+  become: true
+  block:
+    - name: Install acl (setfacl gives the operators the socket)
+      ansible.builtin.apt:
+        name: acl
+        state: present
+
+    - name: Create the socket group
+      ansible.builtin.group:
+        name: "{{ vault_server_socket_group }}"
+        system: true
+
+    - name: Create the vault system user
+      ansible.builtin.user:
+        name: "{{ vault_server_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ vault_server_data_dir }}"
+        create_home: false
+
+    - name: Create the Vault directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ vault_server_config_dir }}", owner: root, group: "{{ vault_server_user }}", mode: "0750" }
+        - path: "{{ vault_server_data_dir }}"
+          owner: "{{ vault_server_user }}"
+          group: "{{ vault_server_user }}"
+          mode: "0700"
+        - path: "{{ vault_server_storage_dir }}"
+          owner: "{{ vault_server_user }}"
+          group: "{{ vault_server_user }}"
+          mode: "0700"
+        - { path: "{{ vault_server_secrets_dir }}", owner: root, group: root, mode: "0700" }
+        - { path: "{{ vault_server_unseal_script | dirname }}", owner: root, group: root, mode: "0755" }
+        - path: "{{ vault_server_audit_dir }}"
+          owner: "{{ vault_server_user }}"
+          group: "{{ vault_server_user }}"
+          mode: "0700"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # A Vault from before the unix-socket change kept raft storage in the data
+    # directory. Raft needs a TCP cluster listener, so its data moves to the
+    # file backend once, with Vault stopped. `vault operator migrate` copies
+    # every key (the keyring, mounts, policies, tokens, the SSH CA), so the
+    # unseal key and the root token stay valid. The raft files stay in
+    # raft.migrated/ (barrier-encrypted, vault-only) until you remove them.
+    - name: Check for raft storage to migrate
+      ansible.builtin.stat:
+        path: "{{ vault_server_raft_db }}"
+      register: vault_server_raft
+
+    - name: Would migrate the raft storage to the file backend
+      ansible.builtin.debug:
+        msg: "{{ vault_server_data_dir }} (raft) -> {{ vault_server_storage_dir }} (file)"
+      changed_when: true
+      when: vault_server_raft.stat.exists and ansible_check_mode
+
+    - name: Migrate the raft storage to the file backend
+      when: vault_server_raft.stat.exists and not ansible_check_mode
+      block:
+        - name: Stop Vault for the migration
+          ansible.builtin.systemd_service:
+            name: vault
+            state: stopped
+
+        - name: Write the migration configuration
+          ansible.builtin.copy:
+            content: |
+              storage_source "raft" {
+                path    = "{{ vault_server_data_dir }}"
+                node_id = "ai-sandbox-vault"
+              }
+              storage_destination "file" {
+                path = "{{ vault_server_storage_dir }}"
+              }
+              cluster_addr = "http://127.0.0.1:8201"
+            dest: "{{ vault_server_migrate_config }}"
+            owner: root
+            group: root
+            mode: "0600"
+
+        # check-mode: "Would migrate the raft storage" reports it; this block runs only for real.
+        - name: Copy every key into the file backend
+          ansible.builtin.command:
+            argv: ["{{ vault_server_bin }}", operator, migrate, "-config={{ vault_server_migrate_config }}"]
+          register: vault_server_migrate
+          changed_when: true
+          failed_when: >-
+            vault_server_migrate.rc != 0
+            or 'All of the keys have been migrated' not in vault_server_migrate.stdout
+
+        - name: Give the migrated storage to the vault user
+          ansible.builtin.file:
+            path: "{{ vault_server_storage_dir }}"
+            owner: "{{ vault_server_user }}"
+            group: "{{ vault_server_user }}"
+            recurse: true
+
+        - name: Create the raft backup directory
+          ansible.builtin.file:
+            path: "{{ vault_server_raft_backup }}"
+            state: directory
+            owner: "{{ vault_server_user }}"
+            group: "{{ vault_server_user }}"
+            mode: "0700"
+
+        # check-mode: "Would migrate the raft storage" reports it; this block runs only for real.
+        - name: Move the raft files aside
+          ansible.builtin.command:
+            argv:
+              - mv
+              - "{{ vault_server_raft_db }}"
+              - "{{ vault_server_data_dir }}/raft"
+              - "{{ vault_server_raft_backup }}/"
+          changed_when: true
+
+        - name: Remove the migration configuration
+          ansible.builtin.file:
+            path: "{{ vault_server_migrate_config }}"
+            state: absent
+
+    - name: Write the Vault configuration
+      ansible.builtin.template:
+        src: vault.hcl.j2
+        dest: "{{ vault_server_config }}"
+        owner: root
+        group: "{{ vault_server_user }}"
+        mode: "0640"
+      notify: vault_server restart
+
+    - name: Install the unseal and socket scripts
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - { src: vault-unseal.j2, dest: "{{ vault_server_unseal_script }}" }
+        - { src: vault-socket.j2, dest: "{{ vault_server_socket_script }}" }
+      loop_control:
+        label: "{{ item.dest }}"
+      notify: vault_server restart
+
+    - name: Rotate the audit log
+      ansible.builtin.template:
+        src: vault-audit.logrotate.j2
+        dest: /etc/logrotate.d/vault-audit
+        owner: root
+        group: root
+        mode: "0644"
+        validate: /usr/sbin/logrotate -d %s
+
+    - name: Install the systemd units
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ vault_server_units }}"
+      loop_control:
+        label: "{{ item.dest }}"
+      notify: vault_server restart
+
+# In a dry run on a fresh host the binary and the units do not exist yet; the
+# service, init and unseal steps then wait for the real run.
+- name: Stat the vault binary and its unit
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: ["{{ vault_server_bin }}", "{{ vault_server_units[0].dest }}"]
+  register: vault_server_present
+
+- name: Decide whether Vault can run in this pass
+  ansible.builtin.set_fact:
+    vault_server_live: >-
+      {{ not ansible_check_mode or (vault_server_present.results | map(attribute='stat.exists') | min) }}
+
+- name: Enable and start Vault
+  ansible.builtin.systemd_service:
+    name: vault
+    enabled: true
+    state: started
+    daemon_reload: true
+  become: true
+  when: vault_server_live
+
+- name: Apply a pending Vault restart now (later roles need it serving)
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for the Vault API
+  ansible.builtin.uri:
+    url: "{{ vault_server_url }}/v1/sys/health"
+    unix_socket: "{{ vault_server_socket }}"
+    # 200 active, 501 not initialised, 503 sealed: all mean "listening".
+    status_code: [200, 501, 503]
+  register: vault_server_health
+  until: vault_server_health is succeeded
+  retries: "{{ 3 if ansible_check_mode else 30 }}"
+  delay: 1
+  check_mode: false
+  # A dry run cannot start Vault, so it may find nothing listening yet.
+  failed_when: vault_server_health is failed and not ansible_check_mode
+  when: vault_server_live
+
+- name: Decide whether Vault is serving in this pass
+  ansible.builtin.set_fact:
+    vault_server_live: "{{ vault_server_live and vault_server_health.status | default(-1) in [200, 501, 503] }}"
+
+- name: Read whether Vault is initialised
+  ansible.builtin.uri:
+    url: "{{ vault_server_url }}/v1/sys/init"
+    unix_socket: "{{ vault_server_socket }}"
+  register: vault_server_init_status
+  check_mode: false
+  when: vault_server_live
+
+- name: Would initialise Vault (one key share) and store the unseal key and root token root-only
+  ansible.builtin.debug:
+    msg: "{{ vault_server_unseal_key_file }}, {{ vault_server_root_token_file }}"
+  changed_when: true
+  when: vault_server_live and ansible_check_mode and not vault_server_init_status.json.initialized
+
+- name: Initialise Vault
+  when: vault_server_live and not ansible_check_mode and not vault_server_init_status.json.initialized
+  become: true
+  block:
+    - name: Initialise Vault with one key share
+      ansible.builtin.uri:
+        url: "{{ vault_server_url }}/v1/sys/init"
+        unix_socket: "{{ vault_server_socket }}"
+        method: PUT
+        body_format: json
+        body: { secret_shares: 1, secret_threshold: 1 }
+      register: vault_server_init
+      no_log: true
+
+    - name: Store the unseal key and root token (root-only)
+      ansible.builtin.copy:
+        content: "{{ item.value }}\n"
+        dest: "{{ item.path }}"
+        owner: root
+        group: root
+        mode: "0600"
+      loop:
+        - { path: "{{ vault_server_unseal_key_file }}", value: "{{ vault_server_init.json['keys_base64'] | first }}" }
+        - { path: "{{ vault_server_root_token_file }}", value: "{{ vault_server_init.json['root_token'] }}" }
+      loop_control:
+        label: "{{ item.path }}"
+      no_log: true
+
+- name: Enable and run the unseal service
+  ansible.builtin.systemd_service:
+    name: ai-sandbox-vault-unseal
+    enabled: true
+    state: started
+  become: true
+  when: vault_server_live and not (ansible_check_mode and not vault_server_init_status.json.initialized)
+
+# ---------------------------------------------------------------------------
+# VERIFICATION — initialised, unsealed, and serving only its unix socket:
+# 0660 for the socket group, rw by ACL for the operators, no TCP listener.
+# Skipped only in a dry run that would install or initialise.
+# ---------------------------------------------------------------------------
+- name: Read the seal status
+  ansible.builtin.uri:
+    url: "{{ vault_server_url }}/v1/sys/seal-status"
+    unix_socket: "{{ vault_server_socket }}"
+  register: vault_server_seal
+  until: vault_server_seal.json is defined and not vault_server_seal.json.sealed
+  retries: 15
+  delay: 1
+  check_mode: false
+  when: vault_server_live and not (ansible_check_mode and not vault_server_init_status.json.initialized)
+
+- name: Stat the Vault socket
+  ansible.builtin.stat:
+    path: "{{ vault_server_socket }}"
+  register: vault_server_socket_stat
+  when: vault_server_live
+
+- name: Read the socket's ACL
+  ansible.builtin.command: getfacl -cp {{ vault_server_socket }}
+  register: vault_server_socket_acl
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when: vault_server_live
+
+# ss -p names other users' processes only for root.
+- name: List the processes listening on TCP
+  ansible.builtin.command: ss -Hltnp
+  register: vault_server_ss
+  changed_when: false
+  check_mode: false
+  become: true
+  when: vault_server_live
+
+- name: Assert Vault is initialised, unsealed and serves its socket only
+  ansible.builtin.assert:
+    that:
+      - vault_server_seal.json.initialized and not vault_server_seal.json.sealed
+      - vault_server_socket_stat.stat.issock
+      - vault_server_socket_stat.stat.mode == '0660'
+      - vault_server_socket_stat.stat.gr_name == vault_server_socket_group
+      - vault_server_operators | map('regex_replace', '^(.*)$', 'user:\\1:rw-')
+        | difference(vault_server_socket_acl.stdout_lines) | length == 0
+      - vault_server_ss.stdout is not search('"vault"')
+    fail_msg: >-
+      Vault seal status {{ vault_server_seal.json | default('unknown') }};
+      {{ vault_server_socket }}: {{ vault_server_socket_stat.stat }} {{ vault_server_socket_acl.stdout_lines }};
+      Vault's TCP listeners: {{ vault_server_ss.stdout_lines | select('search', '"vault"') | list }}
+    success_msg: >-
+      Vault {{ vault_server_seal.json.version }} unsealed on {{ vault_server_socket }} only
+      ({{ vault_server_socket_group }} and {{ vault_server_operators | join(', ') }})
+  when: vault_server_live and not (ansible_check_mode and not vault_server_init_status.json.initialized)
+
+# The units' sandboxing, scored by systemd (0 best, 10 worst); measured when
+# it was set, so a weaker unit fails here (concepts/Vault and Consul Host Trust).
+- name: Score the sandboxing of Vault's unit
+  ansible.builtin.command: systemd-analyze security --no-pager {{ item }}.service
+  loop: [vault]
+  register: vault_server_security
+  changed_when: false
+  check_mode: false
+  when: vault_server_live and not ansible_check_mode
+
+- name: Assert the sandboxing of Vault's unit has not weakened
+  ansible.builtin.assert:
+    that: vault_server_score | float <= vault_server_max_exposure
+    fail_msg: >-
+      {{ item.item }}.service exposure {{ vault_server_score }}, at most {{ vault_server_max_exposure }}:
+      {{ item.stdout_lines | last }}
+    success_msg: "{{ item.item }}.service exposure {{ vault_server_score }} (at most {{ vault_server_max_exposure }})"
+  loop: "{{ vault_server_security.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    vault_server_score: "{{ item.stdout_lines | last | regex_search('[0-9]+[.][0-9]+') }}"
+  when: vault_server_live and not ansible_check_mode
+...
