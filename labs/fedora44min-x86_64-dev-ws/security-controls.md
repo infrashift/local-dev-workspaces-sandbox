@@ -9,10 +9,11 @@ An AI coding agent can work on private code without ever holding a real credenti
 site that no one approved. This document explains, at a high level, the controls that make that true
 and how people should work inside them.
 
-It covers the ai-sandbox lab (`labs/fedora44min-x86_64-dev-ws` in the local-dev-workspaces-sandbox repository): Claude
-Code and a Python toolchain run in an isolated Fedora 44 virtual machine, and a zero-trust gateway on
-the Linux host holds every real credential. The design assumes **the agent is compromised**: through
-a mistake, a malicious dependency or a prompt injection in code, issues or web content it reads.
+It covers the ai-sandbox lab (`labs/fedora44min-x86_64-dev-ws` in the [local-dev-workspaces-sandbox
+repository](https://github.com/infrashift/local-dev-workspaces-sandbox)): Claude Code and a Python
+toolchain run in an isolated Fedora 44 virtual machine, and a zero-trust gateway on the Linux host
+holds every real credential. The design assumes **the agent is compromised**: through a mistake, a
+malicious dependency or a prompt injection in code, issues or web content it reads.
 
 > **Warning:** The controls below are built and verified on a **Pop!_OS or Ubuntu 24.04 LTS** host
 > only. The host bootstrap and gateway automation use `apt` and Debian/Ubuntu package names, paths,
@@ -184,6 +185,10 @@ correct or safe, and some trust remains by design.
   credentials.
 
 ## References
+
+All paths are in the
+[local-dev-workspaces-sandbox repository](https://github.com/infrashift/local-dev-workspaces-sandbox).
+The wiki pages live under `.okfw/`.
 
 | Topic | Where |
 | --- | --- |
