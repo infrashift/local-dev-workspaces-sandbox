@@ -1,8 +1,5 @@
 # Security Controls for AI-Augmented Software Development
 
-As of 2026-10-27. The shared, editable copy of this document is
-[on claude.ai](https://claude.ai/artifact/Nvc281HKKjPg7z99qax579).
-
 ## Purpose and scope
 
 An AI coding agent can work on private code without ever holding a real credential or reaching a
