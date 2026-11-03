@@ -1,0 +1,35 @@
+---
+# The operator's egress allow list: what the sandbox may reach through the
+# CONNECT tunnel (GATEWAY_IP:PROXY_PORT) beyond the baseline catalog
+# (egress-baseline.yml). The single source for Consul's
+# ai-sandbox/egress/allow/ keys (concepts/Egress Allow List in Consul KV):
+#
+#   make -f lab-gateway.mk allow-list                  # the file and Consul, side by side
+#   make -f lab-gateway.mk allow HOST=<host:port> REASON="why" [USER=] [EXPIRES=YYYY-MM-DD]
+#   make -f lab-gateway.mk deny HOST=<host:port>
+#   make -f lab-gateway.mk allow-plan | allow-sync      # after editing this file by hand
+#
+# allow and deny edit this file and then sync it. allow-sync makes Consul
+# match the file, so a key someone added by hand is removed. Commit this file
+# after a change: the history is the review trail.
+#
+# One entry per line (allow and deny edit the file line by line):
+#   kind     https  a TLS site (port 443 unless set)
+#            tcp    any other TCP service (port required). Only a client that
+#                   speaks HTTP CONNECT, or one wrapped in
+#                   `ncat --proxy <gateway>:<port> --proxy-type http`, can use it.
+#            ssh    ssh/scp through the guest's ncat ProxyCommand (port 22
+#                   unless set). `user` is the login, and the sandbox
+#                   ssh-agent's Vault-signed certificate is issued for every
+#                   ssh user named here (concepts/SSH Agent Forwarding).
+#   host     a DNS name or an IPv4 address; https may use *.<suffix>. Never a
+#            gateway host (vars/gateway.yml), or a subdomain of one: those go
+#            through the TLS gateway, never the tunnel.
+#   reason   why the entry exists (no " or \)
+#   added    the date it was added (allow fills it in)
+#   expires  optional: from this date the entry is left out, and allow-sync
+#            removes it from Consul
+# yamllint disable rule:line-length
+egress_allow:
+  - { kind: ssh, host: "192.168.151.10", port: 22, user: scp-target, reason: "scenario 4: scp to upstream-1", added: 2026-10-27 }
+...

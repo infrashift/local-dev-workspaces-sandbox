@@ -26,7 +26,7 @@ an agent cannot send code or data to a site of its choice.
 ## Preconditions
 
 1. UAT-LIFE-01 passes.
-2. `example.com:443` is not on the allow list (`make -f lab-gateway.mk allowlist | grep example.com`
+2. `example.com:443` is not on the allow list (`make -f lab-gateway.mk allow-list | grep example.com`
    prints nothing).
 
 ## Steps

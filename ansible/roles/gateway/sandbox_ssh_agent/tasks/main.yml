@@ -36,7 +36,10 @@
       - sandbox_ssh_agent_socket is defined and sandbox_ssh_agent_socket is match('^/run/user/\d+/[^/ ]+/[^/ ]+\.sock$')
       - sandbox_ssh_agent_vault_socket is defined and sandbox_ssh_agent_vault_socket is match('^/[^ ]+\.sock$')
       - sandbox_ssh_agent_operator_dir is defined and sandbox_ssh_agent_operator_dir is match('^/[^ ]+$')
-      - sandbox_ssh_agent_principal is defined and sandbox_ssh_agent_principal is match('^[a-z][a-z0-9-]*$')
+      - sandbox_ssh_agent_principals is defined and sandbox_ssh_agent_principals is sequence
+      - sandbox_ssh_agent_principals is not string and sandbox_ssh_agent_principals | length > 0
+      - sandbox_ssh_agent_principals | reject('match', '^[a-z][a-z0-9-]*$') | list | length == 0
+      - sandbox_ssh_agent_ssh_role is defined and sandbox_ssh_agent_ssh_role is match('^[a-z0-9-]+$')
       - sandbox_ssh_agent_ttl is defined and sandbox_ssh_agent_ttl is match('^\d+[mh]$')
       - sandbox_ssh_agent_ssh_mount is defined and sandbox_ssh_agent_ssh_mount is match('^[a-z0-9-]+$')
     fail_msg: >-
@@ -45,7 +48,8 @@
         sandbox_ssh_agent_socket        /run/user/<uid>/<dir>/<name>.sock (SANDBOX_AGENT_SOCK)
         sandbox_ssh_agent_vault_socket  vault_server's unix socket (the operator opens it by ACL)
         sandbox_ssh_agent_operator_dir  OPERATOR_DIR (the Vault operator token, the helper)
-        sandbox_ssh_agent_principal     the SCP target's user, the certificate's only principal
+        sandbox_ssh_agent_principals    the ssh users of the egress allow file: the certificate's principals
+        sandbox_ssh_agent_ssh_role      vault_gateway's SSH role (vault_gateway_ssh_role)
         sandbox_ssh_agent_ttl           certificate lifetime, <n>m or <n>h
         sandbox_ssh_agent_ssh_mount     vault_gateway's SSH CA mount
     quiet: true
@@ -53,7 +57,7 @@
 - name: Show the requested parameters
   ansible.builtin.debug:
     msg: >-
-      {{ sandbox_ssh_agent_socket }}: {{ sandbox_ssh_agent_key }} for {{ sandbox_ssh_agent_principal }}
+      {{ sandbox_ssh_agent_socket }}: {{ sandbox_ssh_agent_key }} for {{ sandbox_ssh_agent_principal_list }}
       ({{ sandbox_ssh_agent_ttl }})
 
 - name: Assert the socket is in this user's runtime directory
@@ -138,6 +142,8 @@
         out = subprocess.run(["ssh-keygen", "-L", "-f", sys.argv[1]], capture_output=True, text=True).stdout
         m = re.search(r"Valid: from \S+ to (\S+)", out)
         print(int((datetime.datetime.fromisoformat(m[1]) - datetime.datetime.now()).total_seconds()) if m else -1)
+        p = re.search(r"Principals:\s*\n((?:[ \t]+\S+\n)*?)[ \t]*Critical", out)
+        print(",".join(sorted(p[1].split())) if p else "")
       - "{{ sandbox_ssh_agent_cert }}"
   register: sandbox_ssh_agent_remaining
   changed_when: false
@@ -156,7 +162,8 @@
 - name: Decide whether the certificate needs signing and loading
   ansible.builtin.set_fact:
     sandbox_ssh_agent_sign: >-
-      {{ sandbox_ssh_agent_remaining.stdout | int < sandbox_ssh_agent_min_seconds
+      {{ sandbox_ssh_agent_remaining.stdout_lines[0] | int < sandbox_ssh_agent_min_seconds
+         or (sandbox_ssh_agent_remaining.stdout_lines[1] | default('')) != sandbox_ssh_agent_principal_list
          or 'ssh-ed25519-cert-v01@openssh.com' not in sandbox_ssh_agent_listed.stdout }}
 
 - name: Would have Vault sign the egress key and load it into the agent
@@ -191,14 +198,24 @@
   check_mode: false
   when: not (sandbox_ssh_agent_sign and ansible_check_mode)
 
-- name: Assert the agent holds the certificate for the principal only
+- name: Assert the agent holds the certificate for exactly the principals
   ansible.builtin.assert:
     that:
       - "'ssh-ed25519-cert-v01@openssh.com' in sandbox_ssh_agent_verify.stdout"
       - >-
-        sandbox_ssh_agent_cert_text.stdout
-        is search('Principals:\s*\n\s*' ~ sandbox_ssh_agent_principal ~ '\s*\n\s*Critical')
+        (sandbox_ssh_agent_cert_text.stdout
+         | regex_search('Principals:\s*\n((?:[ \t]+\S+\n)*?)[ \t]*Critical', '\\1') | first | split | sort | join(','))
+        == sandbox_ssh_agent_principal_list
     fail_msg: "{{ sandbox_ssh_agent_verify.stdout }} / {{ sandbox_ssh_agent_cert_text.stdout }}"
     success_msg: "{{ sandbox_ssh_agent_cert_text.stdout_lines | select('search', 'Valid:') | first | trim }}"
+  when: not (sandbox_ssh_agent_sign and ansible_check_mode)
+
+# What the certificate is issued for, for the operator scripts:
+# egress-allowlist.sh principals-drift compares the allow file's ssh users with it.
+- name: Record the certificate's principals for the operator scripts
+  ansible.builtin.copy:
+    content: "{{ sandbox_ssh_agent_principal_list }}\n"
+    dest: "{{ sandbox_ssh_agent_operator_dir }}/ssh-principals"
+    mode: "0644"
   when: not (sandbox_ssh_agent_sign and ansible_check_mode)
 ...

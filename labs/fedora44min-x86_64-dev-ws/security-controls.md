@@ -87,9 +87,9 @@ still caught by another, such as Envoy's source filter.
 | Network isolation | The VM sits on an isolated libvirt network with no NAT, no route off the host and no DNS. A host firewall lets it reach only the gateway's two ports, and Envoy accepts connections only from the sandbox subnet. | The agent has no way out except the gateway, even as root in the VM. Neighbours cannot use the gateway. |
 | Credentials | The VM holds **surrogates**: published, worthless placeholders for each GitHub PAT and the Anthropic key. Envoy swaps a surrogate for the real credential, which it reads from Vault, on the way out. | No real secret exists in the VM to steal. A real token smuggled in is refused, because only surrogates have records. |
 | Anti-replay | Each surrogate is bound to its target hosts and, for GitHub, to one repository. Paths are normalized before the check, and each host is rate-limited. The filter fails closed. | A surrogate works only where it was meant to. A path trick or a flood does not get past it. |
-| Egress | A default-deny allow list in Consul, seeded from a reviewed catalog of package and registry hosts (PyPI, Fedora, container registries and others), HTTPS only. Operator additions carry a reason and take effect in seconds. | The agent can install packages but cannot send data to a site of its choice. |
+| Egress | A default-deny allow list in Consul, seeded from a reviewed catalog of package and registry hosts (PyPI, Fedora, container registries and others), HTTPS only. Operator additions live in a committed file (`ansible/vars/egress-allow.yml`: HTTPS, TCP or SSH, each with a reason and optionally an expiry date) and take effect in seconds; a check flags any key in Consul the file does not name. | The agent can install packages but cannot send data to a site of its choice. |
 | Least privilege for agent tools | One fine-grained PAT per repository, Contents and Metadata read-only. The GitHub MCP servers run in read-only mode. | The agent can read but not push, open issues or merge. |
-| SSH credentials | A dedicated ssh-agent on the host holds one egress key, separate from the operator's own agent. Vault's SSH CA signs it for one login (`scp-target`) for 8 hours, and Vault audits every signing. Only the dev ssh session forwards the agent; the admin session forwards nothing. Each SSH target must also be on the allow list. | No SSH key exists in the VM. The VM can ask for a signature while a dev session is open, but cannot copy the key or use it after the certificate expires. |
+| SSH credentials | A dedicated ssh-agent on the host holds one egress key, separate from the operator's own agent. Vault's SSH CA signs it for the logins of the allow file's SSH entries (today `scp-target` alone) for 8 hours, and Vault audits every signing. Only the dev ssh session forwards the agent; the admin session forwards nothing. Each SSH target must also be on the allow list. | No SSH key exists in the VM. The VM can ask for a signature while a dev session is open, but cannot copy the key or use it after the certificate expires. |
 | Operator access and audit | Vault and Consul listen only on unix sockets. The daily operator token sees metadata but cannot read a secret. Break-glass gives a 15-minute, non-renewable, response-wrapped token that records who and why. Every Vault request is in a fail-closed audit log. | Reading a real credential is rare, deliberate and traceable. |
 | PKI and TLS | A private gateway CA (P-384, name-constrained to the gateway's host names, every IP excluded) signs Envoy's certificate. Envoy verifies every upstream by SNI and name. | A leaked CA key could not impersonate any other site to the VM. |
 | Supply chain and configuration | Every tool is pinned and verified by SHA-256, and Envoy and Terraform by GPG signature too. Python requirements are hash-locked. Ansible roles follow a contract: no defaults, a dry run before every change, and asserts on their result. | What runs is what was reviewed, and drift shows up as a pending change. |
@@ -127,8 +127,8 @@ the `make` targets, which validate input and keep tokens out of logs.
 | Task | How | Safety rule |
 | --- | --- | --- |
 | Allow a site | `make -f lab-gateway.mk allow HOST=<host:port> REASON="why"` | Allow a specific vendor host, never a shared cloud wildcard. Give a reason. Remove it with `deny` when the task ends. |
-| Review the allow list | `make -f lab-gateway.mk allowlist` | Review the operator entries regularly. Each shows its reason. |
-| Load or rotate a credential | `make -f lab-gateway.mk secrets NAME=<name>` | One fine-grained, read-only PAT per repository. Rotate before expiry and at once after a suspected leak. Revoke the old PAT on GitHub. |
+| Review the allow list | `make -f lab-sandbox-ops.mk allow-list`, `denied` | Review the operator entries regularly: each shows its kind and reason, and `git log -p ansible/vars/egress-allow.yml` who added it. Give a temporary need an `EXPIRES=` date. |
+| Load or rotate a credential | `make -f lab-sandbox-ops.mk secret-rotate NAME=<name>`, `secrets-list` | One fine-grained, read-only PAT per repository. Record its expiry in the registry (the gateway playbook warns 14 days before). Rotate before expiry and at once after a suspected leak. Revoke the old PAT on GitHub. |
 | Renew the SCP certificate | `make -f lab-gateway.mk agent-cert` | It lasts 8 hours. Renew it only when SCP is needed. |
 | Read a real credential | `make -f lab-gateway.mk break-glass REASON="why"` | Emergencies only. The token lasts 15 minutes and every read is audited. |
 | Review access | `sudo` on `/var/log/vault/audit.log` | Check every break-glass use against its stated reason. |
@@ -164,8 +164,10 @@ correct or safe, and some trust remains by design.
 - **Read access is still access.** The agent can read every file in the repositories its PATs cover
   and pass that content to the model provider. Choose those repositories with that in mind.
 - **A forwarded agent signs for whoever asks.** While a dev session is open, any process in the VM
-  can ask the sandbox agent to sign, and so log in as `scp-target` to any allow-listed server that
-  trusts Vault's SSH CA. The 8-hour certificate, the single login and the allow list bound this.
+  can ask the sandbox agent to sign, and so log in as any of the certificate's logins (the allow
+  file's SSH users, today `scp-target`) to any allow-listed server that trusts Vault's SSH CA. The
+  8-hour certificate, the short list of logins and the allow list bound this: each SSH user added to
+  the allow file widens it.
   Close dev sessions you don't need, and renew the certificate only when SCP is needed.
 - **Generated code is untrusted.** Nothing here reviews logic, licences or secrets that the agent
   writes into code. Human review and CI stay required.

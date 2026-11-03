@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # {{ ansible_managed }}
 # ai-sandbox-agent-cert: have Vault's SSH CA sign the sandbox egress key for
-# principal {{ sandbox_ssh_agent_principal }} ({{ sandbox_ssh_agent_ttl }}), then load the key and certificate into the
-# dedicated sandbox ssh-agent with the same lifetime. The certificate is the
-# only credential the SCP target accepts; it expires on its own.
+# principals {{ sandbox_ssh_agent_principal_list }} ({{ sandbox_ssh_agent_ttl }}): the ssh users of the
+# egress allow file. Then load the key and certificate into the dedicated
+# sandbox ssh-agent with the same lifetime. The certificate is the only
+# credential the SSH targets accept; it expires on its own.
 #   make -f lab-gateway.mk agent-cert
 set -euo pipefail
 
@@ -12,7 +13,8 @@ TOKEN_FILE={{ sandbox_ssh_agent_token_file }}
 KEY={{ sandbox_ssh_agent_key }}
 CERT={{ sandbox_ssh_agent_cert }}
 SOCK={{ sandbox_ssh_agent_socket }}
-ROLE={{ sandbox_ssh_agent_principal }}
+ROLE={{ sandbox_ssh_agent_ssh_role }}
+PRINCIPALS={{ sandbox_ssh_agent_principal_list }}
 TTL={{ sandbox_ssh_agent_ttl }}
 
 [ -r "$TOKEN_FILE" ] || { echo "No operator token at $TOKEN_FILE: run make -f lab-gateway.mk gateway" >&2; exit 1; }
@@ -27,7 +29,7 @@ vault() { curl -sf --unix-socket "$VAULT_SOCKET" "$@"; }
 vault -o /dev/null -X POST -H @<(header) "$VAULT/v1/auth/token/renew-self"
 
 request="$(python3 -c 'import json, sys; print(json.dumps({"public_key": open(sys.argv[1]).read().strip(),
-  "valid_principals": sys.argv[2], "ttl": sys.argv[3], "cert_type": "user"}))' "$KEY.pub" "$ROLE" "$TTL")"
+  "valid_principals": sys.argv[2], "ttl": sys.argv[3], "cert_type": "user"}))' "$KEY.pub" "$PRINCIPALS" "$TTL")"
 response="$(vault -X POST -H @<(header) --data "$request" "$VAULT/v1/{{ sandbox_ssh_agent_ssh_mount }}/sign/$ROLE")"
 umask 022
 python3 -c 'import json, sys; print(json.load(sys.stdin)["data"]["signed_key"].strip())' <<<"$response" >"$CERT.tmp"

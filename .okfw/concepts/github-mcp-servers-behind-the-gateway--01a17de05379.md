@@ -17,7 +17,7 @@ status: "draft"
 # GitHub MCP Servers Behind the Gateway
 
 The sandbox reaches GitHub through `github/github-mcp-server`, deployed three ways for **each** private
-repository in `vars/gateway.yml` `github_repos` (decided 2026-10-27). Each repository has its own
+repository in `github_repos`, the `github-pat` entries of `vars/gateway-secrets.yml` ([Gateway Secrets Registry](/concepts/gateway-secrets-registry--01a1a358cacd.md); decided 2026-10-27). Each repository has its own
 fine-grained PAT, limited to that repository, and its own surrogates. The TLS gateway swaps a surrogate
 for that repository's PAT, which only Vault holds ([Gateway Credentials in the Host Inventory](/concepts/gateway-credentials-in-the-host-inventory--01a17e133adc.md)).
 

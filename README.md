@@ -24,6 +24,7 @@ make -f lab-gateway.mk                # the zero-trust gateway (Vault, Consul, E
 make -f lab-gateway-verify.mk         # verify the gateway
 make -f lab-provision.mk apply        # then: apply, status, start, stop, ssh, destroy ...
 make -f lab-provision-verify.mk       # verify the lab VMs
+make -f lab-sandbox-ops.mk            # Day 2: status, up/down, ssh, allow/deny, secrets, audit ...
 ```
 
 Each lab's `README.md` gives the full operator procedure. For the security model, read

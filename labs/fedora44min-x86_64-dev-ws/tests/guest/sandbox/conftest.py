@@ -7,7 +7,7 @@ the local GitHub MCP server), with the real credentials loaded:
     make -f lab-provision.mk play PLAYBOOK=python-stack
     make -f lab-provision-verify.mk STACK=sandbox
 
-The GitHub tests run once per repository in vars/gateway.yml github_repos,
+The GitHub tests run once per repository in vars/gateway-secrets.yml (its github-pat entries),
 each with that repository's surrogates. Every test is read-only; the `vm`,
 `admin` and `dev` fixtures come from tests/guest/conftest.py.
 """

@@ -10,6 +10,9 @@ sandbox_ssh_agent_unit_dir: "{{ sandbox_ssh_agent_home }}/.config/systemd/user"
 sandbox_ssh_agent_unit: ai-sandbox-ssh-agent.service
 sandbox_ssh_agent_helper: "{{ sandbox_ssh_agent_operator_dir }}/bin/ai-sandbox-agent-cert"
 sandbox_ssh_agent_token_file: "{{ sandbox_ssh_agent_operator_dir }}/vault-operator.token"
+# The principals as the certificate lists them, sorted and comma-joined (the
+# form egress_allow.py principals prints).
+sandbox_ssh_agent_principal_list: "{{ sandbox_ssh_agent_principals | sort | join(',') }}"
 # Re-sign when less than this many seconds of validity remain.
 sandbox_ssh_agent_min_seconds: 3600
 ...

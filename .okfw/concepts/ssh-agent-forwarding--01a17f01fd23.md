@@ -24,21 +24,39 @@ the guest: a dedicated ssh-agent on the host, forwarded into the dev session onl
   `/run/user/<uid>/ai-sandbox/ssh-agent.sock`, 0700. It is never the operator's own agent. The
   agent holds one key, `~/.ssh/key.d/ai-sandbox.egress`, which never leaves the host, and that
   key's certificate.
-- **The certificate comes from Vault's SSH CA** (`ssh-sandbox/sign/scp-target`). It is good for
-  principal `scp-target` only, for 8 h, and allows no extensions except `permit-pty`.
+- **The certificate comes from Vault's SSH CA** (`ssh-sandbox/sign/sandbox-egress`). It is good for
+  the principals named by the `kind: ssh` entries of `vars/egress-allow.yml` (today `scp-target`
+  alone), for 8 h, and allows no extensions except `permit-pty`. Until 2026-11-03 the role was
+  `ssh-sandbox/roles/scp-target` with the one fixed principal `scp_target_user`. `vault_gateway`
+  now prunes any SSH role other than `sandbox-egress`.
   `ai-sandbox-agent-cert` (`make -f lab-gateway.mk agent-cert`) signs it with the operator token,
   over Vault's unix socket, and loads key and certificate with the same lifetime.
 - **Only the dev session forwards it** (`lab_ssh`: `ForwardAgent yes` and `IdentityAgent` the
   sandbox socket, for `local.<lab>.dev` alone). Inside the guest, `scp` goes through the CONNECT
-  tunnel (`ProxyCommand ncat`, which needs an allow-list entry for the target's `:22`). The agent on
+  tunnel (`ProxyCommand ncat`, which needs a `kind: ssh` allow entry for the target's `:22`). The agent on
   the host signs the challenge, and the guest never reads the key.
 - **The target, upstream-1, trusts only the CA** (`upstream_ssh_target`: `TrustedUserCAKeys`, for
   user `scp-target`).
 
+## Principals from the allow file
+`gateway-host.yml` sets `ssh_principals` to the sorted, unique `user`s of the allow file's ssh entries,
+and fails when there are none. `vault_gateway` makes them the `sandbox-egress` role's `allowed_users`,
+and `sandbox_ssh_agent` signs `valid_principals` with them. The agent re-signs when the certificate's
+principals differ from the file, as well as when it nears expiry. The role then records the list in
+`OPERATOR_DIR/ssh-principals`. `egress-allowlist.sh principals-drift` compares the file with that
+record, so `make -f lab-gateway.mk allow`, `deny` and `allow-sync` re-run the gateway for
+`TAGS=vault,ssh_agent` when the users change. Verified live 2026-11-03: adding
+`git.example.com:22 USER=git` issued a certificate for `git, scp-target`, and removing it went back to
+`scp-target`.
+
+Trade-off (analysis): every ssh user added widens what a process in the guest can ask the forwarded
+agent to sign for (below). Add a user for a real target only, and give a temporary one an `expires`
+date.
+
 ## What the guest can still do
 While a dev session is open, the guest can ask the agent for *any* signature with the egress key:
-- an SSH authentication to any host that trusts the CA or the key (today only upstream-1, and only
-  as `scp-target`);
+- an SSH authentication to any host that trusts the CA or the key, as any of the certificate's
+  principals (today only upstream-1, and only as `scp-target`);
 - arbitrary data, `ssh-keygen -Y sign` (verified 2026-10-27).
 
 The certificate's principal and lifetime, and the CA being trusted in one place, are what bound

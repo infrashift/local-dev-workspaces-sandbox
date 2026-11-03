@@ -1,8 +1,8 @@
 """The gateway's real credentials: encrypted in the host inventory, then loaded into Vault as configured.
 
-inventory-host/host_vars/localhost/vars.yml (committed) maps each secret name
-to the ansible-vault variable that holds it; vault.yml beside it (gitignored,
-0600) holds each one encrypted with the lab's .ansible_vault_key. The gateway
+vars/gateway-secrets.yml (committed) names each secret, its kind and repository,
+and the ansible-vault variable that holds it; the host inventory's vault.yml
+(gitignored, 0600) holds each one encrypted with the lab's .ansible_vault_key. The gateway
 playbook writes one Vault record per surrogate in vars/gateway.yml, bound to
 its hosts and repository, and the same binding without the secret in the
 record's metadata. The operator token reads only that metadata -- never a real
@@ -17,16 +17,16 @@ import subprocess
 import gateway_lab as gw
 import lab
 import pytest
-import yaml
 from lab import GATEWAY
 
 L = lab.lab()
-FIX = f"run {GATEWAY} secrets"
+FIX = f"run {GATEWAY} secret-set"
 KV = gw.role_vars("vault_gateway")["vault_gateway_kv_mount"]
 SURROGATES = gw.GATEWAY_VARS["surrogates"]
-REPOS = gw.GATEWAY_VARS["github_repos"]
-SECRETS = yaml.safe_load(L.credentials_vars.read_text())["gateway_secrets"]
-VARIABLES = {name: re.fullmatch(r"\{\{\s*(\w+)\s*\}\}", ref).group(1) for name, ref in SECRETS.items()}
+REGISTRY_FILE = "vars/gateway-secrets.yml"
+SECRETS = lab.secret_registry()
+REPOS = lab.github_repos()
+VARIABLES = {name: spec["vault_var"] for name, spec in SECRETS.items()}
 
 
 def record_id(credential: str) -> str:
@@ -43,12 +43,11 @@ def vault_blocks() -> dict[str, str]:
 
 def test_every_surrogate_names_a_secret():
     missing = {s["secret"] for s in SURROGATES.values()} - set(SECRETS)
-    assert not missing, f"surrogates name secrets that {L.credentials_vars} lacks: {sorted(missing)}"
+    assert not missing, f"surrogates name secrets that {REGISTRY_FILE} lacks: {sorted(missing)}"
 
 
 @pytest.mark.parametrize("key", sorted(REPOS))
 def test_repository_has_its_pat_and_three_surrogates(key):
-    assert key in SECRETS, f"{REPOS[key]['repo']} has no PAT in {L.credentials_vars} gateway_secrets"
     bound = [s for s in SURROGATES.values() if s.get("repo") == REPOS[key]["repo"]]
     assert sorted(s["use"] for s in bound) == ["api", "git", "mcp"], (
         f"{REPOS[key]['repo']} needs one git, one api and one mcp surrogate in vars/gateway.yml"

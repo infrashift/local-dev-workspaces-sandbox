@@ -52,4 +52,4 @@ The gateway swaps it for the real PAT of that one repository. See
 [Surrogate Credential Model](../../../../.okfw/concepts/surrogate-credential-model--01a17ecc92e2.md).
 
 If step 2 fails with 401, the PAT in Vault is wrong or missing: the operator runs `make -f
-lab-gateway.mk secrets NAME=private-scratch-1`.
+lab-gateway.mk secret-set NAME=private-scratch-1`.

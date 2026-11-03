@@ -14,14 +14,15 @@ description: "make -f lab-gateway.mk allow HOST=github.com:443 writes the entry 
 x:
   severity: "low"
   priority: "P3"
-  state: "open"
+  state: "fixed"
+  fixed: "2026-11-03, egress_allow.py (the allow file's rules)"
   origin: "pre-existing (scripts/gateway/egress-allowlist.sh)"
   found: "2026-10-27, writing the UAT specs (UAT-EGR-02)"
 ---
 
 # The allow target accepts a gateway host
 
-**Severity low, P3, open.** No security effect, but the documentation and the code disagree, and the
+**Severity low, P3, fixed 2026-11-03.** No security effect, but the documentation and the code disagree, and the
 allow list then shows an entry that does nothing.
 
 ## What happens
@@ -41,6 +42,18 @@ allowlist`, where it looks as if it works.
 `egress-allowlist.sh add` refuses a host that is a gateway host or a subdomain of one, and names the
 reason (the guests' NO_PROXY sends such a host to the TLS gateway). It reads the gateway hosts from
 `ansible/vars/gateway.yml`, as the catalog check in `test_allowlist.py` does.
+
+## Resolution
+Fixed 2026-11-03 with the file-backed allow list
+([Egress Allow List in Consul KV](/concepts/egress-allow-list-in-consul-kv--01a17f01fd5d.md)).
+`scripts/gateway/egress_allow.py` reads the gateway hosts from `vars/gateway.yml` and refuses:
+- an entry that is a gateway host;
+- an entry that sits under one (`foo.codeload.github.com`);
+- a wildcard that covers one.
+
+It applies the same rules to every line of `ansible/vars/egress-allow.yml`
+(`tests/gateway/test_allowlist.py::test_allow_file_keeps_every_rule`). Verified live:
+`make -f lab-gateway.mk allow HOST=github.com:443 REASON=x` refuses and writes nothing.
 
 ## Acceptance
 - UAT-EGR-02 step 9 passes: the command refuses github.com:443 and writes nothing.

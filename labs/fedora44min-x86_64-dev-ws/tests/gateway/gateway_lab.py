@@ -34,6 +34,10 @@ PLAYBOOK = "gateway-host.yml"
 PINS = lab.play_vars(PLAYBOOK)
 GATEWAY_VARS = lab.vars_file("gateway.yml")
 CATALOG = lab.vars_file("egress-baseline.yml")["egress_catalog"]
+# The operator's allow file (egress-allow.yml): its entries, and the ssh users
+# the sandbox agent's certificate is issued for.
+ALLOW_FILE = lab.vars_file("egress-allow.yml")["egress_allow"] or []
+SSH_PRINCIPALS = sorted({entry["user"] for entry in ALLOW_FILE if entry["kind"] == "ssh"})
 ROUTES = GATEWAY_VARS["gateway_routes"]
 GATEWAY_HOSTS = [route["host"] for route in ROUTES]
 SYSTEM_BIN = Path(PINS["system_bin"])

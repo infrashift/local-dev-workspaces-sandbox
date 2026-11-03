@@ -20,10 +20,11 @@ SCRIPT = L.project_root / "scripts" / "gateway" / "egress-allowlist.sh"
 
 
 def test_list_shows_the_whole_allow_list():
-    out = lab.run([str(SCRIPT), str(L.operator_dir), "list"])
-    assert out.returncode == 0, f"{SCRIPT} list failed: {out.stderr.strip()}: run {GATEWAY} allowlist"
+    vars_dir = L.lab_dir / "ansible" / "vars"
+    out = lab.run([str(SCRIPT), str(L.operator_dir), str(vars_dir), str(L.venv / "bin" / "python"), "list"])
+    assert out.returncode == 0, f"{SCRIPT} list failed: {out.stderr.strip()}: run {GATEWAY} allow-list"
     # The count goes to stderr, so stdout stays one entry per line.
-    count = re.search(r"^(\d+) entries$", out.stderr + out.stdout, re.MULTILINE)
+    count = re.search(r"^(\d+) entries", out.stderr + out.stdout, re.MULTILINE)
     assert count, f"{SCRIPT} list printed no entry count: {out.stdout[:200]}"
     keys = gw.kv_keys()
     assert int(count.group(1)) == len(keys), (
