@@ -37,12 +37,19 @@ How the operator works the gateway's tools: when to use the make targets, when t
 | Task | Interface |
 |---|---|
 | Install, change or repair the gateway | `make -f lab-gateway.mk` (dry run, then `yes`) |
-| Load or rotate a real credential | `make -f lab-gateway.mk secrets [NAME=…]` |
-| List, allow or remove an egress entry | `make -f lab-gateway.mk allowlist`, `allow HOST=… REASON=…`, `deny HOST=…` |
-| Renew the sandbox agent's certificate | `make -f lab-gateway.mk agent-cert` |
+| Load or rotate a real credential | `make -f lab-gateway.mk secret-set [NAME=…]`, `secret-rotate NAME=…`; `secrets-list`, `secrets-check` ([Gateway Secrets Registry](/concepts/gateway-secrets-registry--01a1a358cacd.md)) |
+| List, allow or remove an egress entry | `make -f lab-gateway.mk allow-list`, `allow HOST=… REASON=… [USER=] [EXPIRES=]`, `deny HOST=…`; `allow-plan` / `allow-sync` after editing `vars/egress-allow.yml` |
+| See what the tunnel refused | `make -f lab-gateway.mk denied [SINCE=24h]` (Envoy's access log in the journal) |
+| Review break-glass use | `make -f lab-gateway.mk audit [SINCE=7d]` (Vault's audit log, through sudo) |
+| Renew the sandbox agent's certificate | `make -f lab-gateway.mk agent-cert` (`agent-cert-status`: principals, time left) |
 | Look around in Vault or Consul | `eval "$(make -s -f lab-gateway.mk cli)"`, then `vault …` / `consul …` |
 | Envoy's state | `curl --unix-socket /run/envoy/admin-readonly.sock http://localhost/stats` (GET only) |
 | Read a real credential (an emergency) | `make -f lab-gateway.mk break-glass REASON="why" [CMD="vault kv get …"]` |
+
+The lab's `lab-sandbox-ops.mk` gathers these targets with the VM lifecycle (`up`, `status`, `ssh`)
+in one entry point ([Operate the Sandbox (Day 2)](/runbooks/operate-the-sandbox-day-2--01a1a3594f4a.md)); it calls them and adds no logic. Two of the changes above land in
+committed files, `vars/egress-allow.yml` and `vars/gateway-secrets.yml`, so a change is also a
+commit: the make targets edit them, and the Ansible run or the allow-list sync applies them.
 
 ## The CLI environment
 `vault_gateway` and `consul_egress` write it into `OPERATOR_DIR` (`~/.config/ai-sandbox`).

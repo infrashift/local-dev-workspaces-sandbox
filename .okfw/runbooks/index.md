@@ -5,6 +5,7 @@
 ## Concepts
 
 * [Bootstrap the macOS Host](bootstrap-the-macos-host--01a1664337ef.md) - Step-by-step: prepare an Apple Silicon Mac for a tf-labs lab with lab-bootstrap.mk.
+* [Operate the Sandbox (Day 2)](operate-the-sandbox-day-2--01a1a3594f4a.md) - Day 2 through lab-sandbox-ops.mk: up/status/ssh, the committed allow file (https, tcp, ssh, expiring entries) and the secrets registry, review with denied and audit, and what is left to the operator.
 * [Provision and Verify the Gateway](provision-and-verify-the-gateway--01a170011e5c.md) - Step-by-step: install the zero-trust gateway with lab-gateway.mk after the host checks pass, load the real credentials, run lab-gateway-verify.mk, and manage the allow list.
 * [Provision the Python Stack](provision-the-python-stack--01a166e751e9.md) - Step-by-step: export the ZScaler chain, bring up the lab VM, and apply the python-stack playbook with its dry run and an idempotency re-run.
 * [Run the Lab Behind a TLS-Inspecting Proxy](run-the-lab-behind-a-tls-inspecting-proxy--01a17ddfc607.md) - Step-by-step: make the host, the gateway (Envoy) and every lab VM trust a TLS-inspecting proxy's CA chain (Zscaler as the example) through TLS_INSPECTION_DIR, verify it, rotate or remove it, and what is not covered.

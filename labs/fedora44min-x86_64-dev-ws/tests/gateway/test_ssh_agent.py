@@ -1,8 +1,9 @@
 """The dedicated sandbox ssh-agent (scenario 4): the only thing the sandbox's dev session forwards.
 
 It holds the egress key and a short-lived certificate Vault's SSH CA signed
-for the SCP target's principal -- nothing else, and never the operator's own
-keys. The certificate expires on its own; `agent-cert` renews it.
+for the ssh users of the egress allow file (egress-allow.yml) -- nothing else,
+and never the operator's own keys. The certificate expires on its own;
+`agent-cert` renews it.
 """
 
 import os
@@ -22,7 +23,7 @@ VARS = gw.role_vars("sandbox_ssh_agent")
 UNIT = VARS["sandbox_ssh_agent_unit"]
 KEY = Path(VARS["sandbox_ssh_agent_key"].replace("{{ sandbox_ssh_agent_home }}", str(Path.home())))
 CERT = Path(str(KEY) + "-cert.pub")
-PRINCIPAL = gw.GATEWAY_VARS["scp_target_user"]
+PRINCIPALS = gw.SSH_PRINCIPALS
 
 
 def agent_identities() -> list[list[str]]:
@@ -58,12 +59,14 @@ def test_agent_holds_only_the_egress_key_and_its_certificate():
     assert len(certs) == 1, f"the sandbox agent holds {len(certs)} certificates, expected 1: run {GATEWAY} agent-cert"
 
 
-def test_certificate_is_for_the_scp_principal_and_still_valid():
+def test_certificate_is_for_the_allow_files_ssh_users_and_still_valid():
     assert CERT.is_file(), f"{CERT} is missing: run {GATEWAY} agent-cert"
     text = lab.run(["ssh-keygen", "-L", "-f", str(CERT)]).stdout
     principals = re.search(r"Principals:\s*\n((?:\s{16}\S+\n)+)", text)
-    assert principals and principals.group(1).split() == [PRINCIPAL], (
-        f"{CERT} is for {principals.group(1).split() if principals else 'no principal'}, expected [{PRINCIPAL}]"
+    got = sorted(principals.group(1).split()) if principals else []
+    assert got == PRINCIPALS, (
+        f"{CERT} is for {got or 'no principal'}, but egress-allow.yml's ssh users are {PRINCIPALS}: "
+        f"run {GATEWAY} gateway TAGS=vault,ssh_agent"
     )
     valid = re.search(r"Valid: from (\S+) to (\S+)", text)
     assert valid, f"{CERT} has no validity window ({text.strip()})"

@@ -22,7 +22,7 @@ GATEWAY_VARS = lab.vars_file("gateway.yml")
 ROUTES = GATEWAY_VARS["gateway_routes"]
 GATEWAY_HOSTS = [route["host"] for route in ROUTES]
 SURROGATES = GATEWAY_VARS["surrogates"]
-REPOS = GATEWAY_VARS["github_repos"]
+REPOS = lab.github_repos()
 GITHUB_MCP = lab.vars_file("github-mcp.yml")
 UPSTREAM_ROUTE = next(route for route in ROUTES if route["upstream"]["ca"] == "upstream")
 # Envoy's Lua filter prefixes every answer it gives itself.

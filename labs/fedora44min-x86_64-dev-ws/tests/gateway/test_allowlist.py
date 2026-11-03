@@ -2,13 +2,17 @@
 
 consul_egress seeds <prefix>/baseline/<category>/<host>:<port> from the
 enabled catalog categories (egress-baseline.yml) and prunes the rest; the
-operator adds <prefix>/allow/<host>:<port>; consul-template renders both into
+operator's allow file (egress-allow.yml) is synced into
+<prefix>/allow/<host>:<port>; consul-template renders both into
 the CONNECT tunnel's route table, which Envoy loads live. Gateway hosts are
 never tunnelled: they have exact 403 entries instead (concepts/Egress Allow
 List in Consul KV).
 """
 
+import datetime
+
 import gateway_lab as gw
+import lab
 import pytest
 from lab import GATEWAY
 
@@ -58,6 +62,30 @@ def test_baseline_in_consul_is_exactly_the_enabled_catalog():
     assert baseline == desired, (
         f"Consul's baseline differs from egress-baseline.yml's enabled categories: "
         f"missing {sorted(desired - baseline)}, stale {sorted(baseline - desired)}: {FIX}"
+    )
+
+
+def test_allow_file_keeps_every_rule():
+    """kinds, ports, ssh users, reasons, no gateway host or subdomain of one (egress_allow.py check)."""
+    L = lab.lab()
+    out = lab.run(
+        [str(L.venv / "bin" / "python"), "-I", str(L.project_root / "scripts" / "gateway" / "egress_allow.py"),
+         "check", str(L.lab_dir / "ansible" / "vars")]
+    )
+    assert out.returncode == 0, f"egress-allow.yml breaks a rule: {out.stderr.strip()}"
+
+
+def test_operator_allow_list_in_consul_is_exactly_the_file():
+    _, allow = kv()
+    today = datetime.date.today()
+    desired = {
+        f"{e['host']}:{e.get('port', {'https': 443, 'ssh': 22}.get(e['kind']))}"
+        for e in gw.ALLOW_FILE
+        if not (e.get("expires") and e["expires"] <= today)
+    }
+    assert allow == desired, (
+        f"Consul's allow/ differs from egress-allow.yml: missing {sorted(desired - allow)}, "
+        f"not in the file {sorted(allow - desired)}: make -f lab-gateway.mk allow-plan, then allow-sync"
     )
 
 

@@ -45,11 +45,11 @@ Owned by the gateway:
 | Path | Holds |
 |---|---|
 | `ansible/roles/gateway/` | `envoy_release`, `gateway_pki`, `vault_server`, `vault_gateway`, `vault_proxy`, `consul_server`, `consul_egress`, `envoy_gateway`, `sandbox_firewall`, `sandbox_ssh_agent` |
-| `scripts/gateway/` | `egress-allowlist.sh` (the allow-list CLI), `sandbox-secret.sh` (loads the real credentials) |
+| `scripts/gateway/` | `egress-allowlist.sh` and `egress_allow.py` (the allow file and Consul), `sandbox-secret.sh` and `gateway_secrets.py` (the real credentials and their registry), `gateway_report.py` (`denied`, `audit`, `agent-cert-status`), `break-glass.sh` |
 | `labs/<lab>/ansible/playbooks/gateway-host.yml` | the gateway's pin block and role order |
-| `labs/<lab>/ansible/vars/gateway.yml`, `egress-baseline.yml` | the gateway routes and surrogates, and the egress catalog |
-| `labs/<lab>/ansible/inventory-host/host_vars/localhost/vars.yml`, `vault.yml` | the gateway's real credentials: their names, and (gitignored) their ansible-vault encrypted values ([Gateway Credentials in the Host Inventory](/concepts/gateway-credentials-in-the-host-inventory--01a17e133adc.md)) |
-| `labs/<lab>/lab-gateway.mk`, `lab-gateway-verify.mk` | install, check, secrets, agent-cert, allow list; the gateway suite |
+| `labs/<lab>/ansible/vars/gateway.yml`, `gateway-secrets.yml`, `egress-baseline.yml`, `egress-allow.yml` | the gateway routes and surrogates, the secrets registry ([Gateway Secrets Registry](/concepts/gateway-secrets-registry--01a1a358cacd.md)), the egress catalog, and the operator allow list |
+| `labs/<lab>/ansible/inventory-host/host_vars/localhost/vault.yml` | the gateway's real credentials: (gitignored) their ansible-vault encrypted values ([Gateway Credentials in the Host Inventory](/concepts/gateway-credentials-in-the-host-inventory--01a17e133adc.md)) |
+| `labs/<lab>/lab-gateway.mk`, `lab-gateway-verify.mk` | install, check, secrets, agent-cert, allow list, denied, audit; the gateway suite. `lab-sandbox-ops.mk` calls these targets but is the lab's, not the gateway's |
 | `labs/<lab>/tests/gateway/` | the gateway suite, with its helper `gateway_lab.py` |
 
 Shared, so an extraction must copy them or depend on them:

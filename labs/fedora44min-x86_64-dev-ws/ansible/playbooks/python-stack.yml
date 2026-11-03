@@ -45,6 +45,7 @@
 
   vars_files:
     - ../vars/gateway.yml
+    - ../vars/gateway-secrets.yml
     - ../vars/github-mcp.yml
 
   vars:

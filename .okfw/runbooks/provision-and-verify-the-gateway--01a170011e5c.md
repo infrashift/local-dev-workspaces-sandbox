@@ -23,7 +23,7 @@ Run every command from the lab directory, `labs/fedora44min-x86_64-dev-ws`.
 
 - `make -f lab-bootstrap.mk all` is done, and `make -f lab-bootstrap-verify.mk` passes.
   `lab-gateway.mk` uses the venv, the collections and the become vault that the bootstrap made.
-- For the GitHub scenarios: for **each** repository in `vars/gateway.yml` `github_repos`, a private
+- For the GitHub scenarios: for **each** `github-pat` entry of `vars/gateway-secrets.yml`, a private
   repository holding at least one file, and a fine-grained PAT limited to it alone (Repository access:
   only that repository; permissions Contents and Metadata, read-only). The resource owner is the
   repository's organisation, which may have to approve the PAT.
@@ -57,20 +57,21 @@ into Vault ([Gateway Credentials in the Host Inventory](/concepts/gateway-creden
 1. Run:
 
    ```sh
-   make -f lab-gateway.mk secrets          # every secret vault.yml lacks; NAME=private-scratch-2 for one
+   make -f lab-gateway.mk secret-set       # every secret vault.yml lacks; NAME=private-scratch-2 for one
    ```
 
 2. Type each value at its prompt: a repository's PAT, or the Anthropic key. The input is not echoed,
    and it travels only on stdin into `ansible-vault encrypt_string`. Each one is written to
-   `inventory-host/host_vars/localhost/vault.yml` (gitignored, 0600) as the variable that `vars.yml`
-   beside it names.
+   `inventory-host/host_vars/localhost/vault.yml` (gitignored, 0600) as the `vault_var` its line in
+   `vars/gateway-secrets.yml` names, and that line records `rotated: <today>` ([Gateway Secrets Registry](/concepts/gateway-secrets-registry--01a1a358cacd.md)).
 3. The target then runs `make -f lab-gateway.mk TAGS=vault`. Read the dry run and type `yes`. The
    playbook checks every PAT and the key against GitHub and Anthropic, then writes one Vault record per
    surrogate.
 
-To add a repository: an entry in `vars/gateway.yml` `github_repos`, its three surrogates there
-(`use: git`, `api`, `mcp`, with `repo:` and `secret:`), its line in `vars.yml` `gateway_secrets`, then
-`make -f lab-gateway.mk secrets NAME=<key>`. `test_credentials` checks that the pieces agree.
+To add a repository: `make -f lab-gateway.mk secret-add NAME=<key> KIND=github-pat REPO=<owner/name>`
+adds its registry line, asks for its PAT, and prints its three surrogates (`use: git`, `api`, `mcp`) to
+add to `vars/gateway.yml`; then run the gateway and the guest playbook. The gateway playbook's
+pre_tasks, `secrets-check` and `test_credentials` check that the pieces agree.
 
 ## Procedure 3: Verify the gateway
 
@@ -89,31 +90,35 @@ To add a repository: an entry in `vars/gateway.yml` `github_repos`, its three su
 |---|---|
 | `test_binaries` | Vault, Consul, consul-template and Envoy are the pinned versions in `/usr/local/bin`, and nothing on PATH shadows them. |
 | `test_pki` | `CA_TRUST_DIR` holds the gateway CA: unexpired, CA-only, and no private key. |
-| `test_credentials` | Every surrogate names a secret, and each repository has its PAT and exactly one git, api and mcp surrogate bound to it. `vault.yml` is 0600 and gitignored, every secret in it is ansible-vault encrypted and decrypts with the lab key, and nothing in it is plaintext. Every surrogate's record metadata matches its hosts, repository, header and scheme, and its value fingerprint is not a surrogate's. The operator token cannot read a record (403), and no record outlives its surrogate. |
+| `test_credentials` | Every surrogate names a registry secret, and each repository has its PAT and exactly one git, api and mcp surrogate bound to it. `vault.yml` is 0600 and gitignored, every secret in it is ansible-vault encrypted and decrypts with the lab key, and nothing in it is plaintext. Every surrogate's record metadata matches its hosts, repository, header and scheme, and its value fingerprint is not a surrogate's. The operator token cannot read a record (403), and no record outlives its surrogate. |
 | `test_vault` | Vault and its unseal unit are active and enabled; Vault is initialised, unsealed and the pinned version. Nothing listens on its former TCP ports (8200/8201). `/run/vault/vault.sock` is `vault-clients` 0660 with `user:<you>:rw-` by ACL, and `upstream.yml` names the same socket. An anonymous read gets 403. The operator token carries only its policy, and `sys/capabilities-self` matches that policy path by path: metadata read and list only, the records themselves and `fixtures/` denied. `/var/log/vault` is vault 0700 and rotated, and `break-glass.yml` uses the gateway's socket and policy. |
 | `test_vault_proxy` | The socket is `vault-proxy:envoy 0660`. The operator is not in group `envoy` and cannot connect. |
 | `test_consul` | Server RPC and gossip on loopback only, and nothing on the former HTTP port 8500. `/run/consul/consul.sock` is `consul-clients` 0660 with `user:<you>:rw-` by ACL. Anonymous requests see and write nothing. The operator token can write `allow/`, not `baseline/`; the probe uses `?cas=1` on a missing key, so it changes nothing either way. |
 | `test_envoy` | Envoy is LIVE and the pinned build. Its TCP listeners are exactly `GATEWAY_IP:{PROXY_PORT,GATEWAY_PORT}`, and every filter chain on them serves `SANDBOX_CIDR` only. The admin socket `/run/envoy/admin.sock` is `envoy` 0600: the operator cannot open it, and nothing listens on :9901. The GET-only view `/run/envoy/admin-readonly.sock` refuses a POST. Every gateway host has a TLS route. |
 | `test_tls_inspection` | Every `ca: system` route verifies with the right bundle: the host's roots, or, when `TLS_INSPECTION_DIR` holds a chain, the public-upstream bundle (root-owned 0644, the host's roots plus the chain, which holds only unexpired CAs and is the chain that really signs the host's traffic). No bundle is left over without a chain. Live, once the sandbox bridge is up: anonymous requests through the TLS gateway pass a verified upstream handshake. See [Run the Lab Behind a TLS-Inspecting Proxy](/runbooks/run-the-lab-behind-a-tls-inspecting-proxy--01a17ddfc607.md). |
-| `test_allowlist` | Consul's baseline equals the enabled catalog categories. Envoy's tunnel table equals baseline ∪ allow minus the gateway hosts. Each gateway host is denied on every tunnel port, `*` is denied last, and no update was rejected. Every catalog entry is well formed, and no wildcard sits on a shared cloud. |
+| `test_allowlist` | Consul's baseline equals the enabled catalog categories, and Consul's `allow/` equals `vars/egress-allow.yml` minus expired entries; every line of that file keeps its rules (`egress_allow.py check`). Envoy's tunnel table equals baseline ∪ allow minus the gateway hosts. Each gateway host is denied on every tunnel port, `*` is denied last, and no update was rejected. Every catalog entry is well formed, and no wildcard sits on a shared cloud. |
 | `test_firewall` | `ai-sandbox-firewall` is active and enabled, and `nftables.service` is not enabled. The ruleset names this lab's bridge, address and ports, and it refuses the gateway address on every interface but the bridge and `lo` ([Isolated Sandbox Network](/concepts/isolated-sandbox-network--01a17e9c824e.md)). |
 | `test_units` | Each service's `systemd-analyze security` exposure is at most the score its role recorded (vault 1.0, vault-proxy 1.1, consul 1.4, envoy 1.7, consul-template 1.1). consul-template runs as its own user, outside `envoy` and `vault-clients`; Envoy is outside `consul-clients`; the route table directory is `consul-template:envoy 2750`. |
-| `test_ssh_agent` | The sandbox agent is up and private. It holds only the egress key and one certificate, for `scp-target`, and the certificate has not expired. |
+| `test_ssh_agent` | The sandbox agent is up and private. It holds only the egress key and one certificate, for exactly the ssh users of `vars/egress-allow.yml` (today `scp-target`), and the certificate has not expired. |
 | `test_operator_cli` | `egress-allowlist.sh list` works and counts every key. Through `OPERATOR_DIR/env.sh`, `vault token lookup` carries the operator policy, the token helper refuses `store` (no `vault login`), and `consul kv get -keys` sees every key. |
 
 ## Daily operation
 
+The recurring tasks are gathered in `lab-sandbox-ops.mk`: see [Operate the Sandbox (Day 2)](/runbooks/operate-the-sandbox-day-2--01a1a3594f4a.md). The gateway's own targets:
+
 | Task | Command |
 |---|---|
-| List the egress allow list. | `make -f lab-gateway.mk allowlist` |
-| Allow a site through the CONNECT tunnel. | `make -f lab-gateway.mk allow HOST=example.com:443 REASON="why"` |
+| List the egress allow list. | `make -f lab-gateway.mk allow-list` |
+| Allow a site, TCP service or SSH target through the CONNECT tunnel. | `make -f lab-gateway.mk allow HOST=example.com:443 REASON="why" [USER=] [EXPIRES=]` |
 | Remove an operator entry. | `make -f lab-gateway.mk deny HOST=example.com:443` |
-| Renew the sandbox agent's certificate (8 h). | `make -f lab-gateway.mk agent-cert` |
-| Rotate a real credential (every surrogate it backs). | `make -f lab-gateway.mk secrets NAME=private-scratch-1` |
+| Make Consul match `vars/egress-allow.yml`. | `make -f lab-gateway.mk allow-plan`, then `allow-sync` |
+| Renew the sandbox agent's certificate (8 h). | `make -f lab-gateway.mk agent-cert` (`agent-cert-status` shows it) |
+| Rotate a real credential (every surrogate it backs). | `make -f lab-gateway.mk secret-rotate NAME=private-scratch-1` |
+| List the real credentials. | `make -f lab-gateway.mk secrets-list` |
 | Read a real credential (an emergency; audited, 15 minutes). | `make -f lab-gateway.mk break-glass REASON="why" [CMD="vault kv get …"]` |
 | Inspect Vault or Consul (read-only). | `eval "$(make -s -f lab-gateway.mk cli)"`, then `vault …` / `consul …` ([Operator Interfaces](/concepts/operator-interfaces--01a17ebdba31.md)) |
 
-Allow-list changes apply live. consul-template renders the route table and Envoy reloads it, with no
+Allow-list changes apply live, and are recorded in the committed `vars/egress-allow.yml`. consul-template renders the route table and Envoy reloads it, with no
 restart. Baseline entries come from `vars/egress-baseline.yml`; to change them, edit that file and
 run `make -f lab-gateway.mk TAGS=consul`.
 

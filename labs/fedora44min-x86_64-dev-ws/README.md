@@ -40,7 +40,7 @@ make -f lab-bootstrap.mk become-vault      # once
 make -f lab-bootstrap.mk all               # Procedure 1
 make -f lab-bootstrap-verify.mk            # Procedure 2
 make -f lab-gateway.mk                     # Procedure 3
-make -f lab-gateway.mk secrets             # Procedure 4 (once)
+make -f lab-gateway.mk secret-set          # Procedure 4 (once)
 make -f lab-gateway-verify.mk              # Procedure 5
 make -f lab-provision.mk apply             # Procedure 6
 make -f lab-provision-verify.mk            # Procedure 7
@@ -48,7 +48,8 @@ make -f lab-provision.mk play PLAYBOOK=python-stack   # Procedure 8 (optional)
 make -f lab-provision-verify.mk STACK=sandbox         # Procedure 9: the gateway end to end
 ```
 
-Do each step only after the step before it passes.
+Do each step only after the step before it passes. After that, day-to-day work goes through one
+makefile, `lab-sandbox-ops.mk` ([Daily operation](#daily-operation)).
 
 ## Supported hosts
 
@@ -80,8 +81,8 @@ Make sure that you have these items:
 - A Pop!_OS or Ubuntu 24.04 LTS x86_64 host with KVM (`/dev/kvm`) and sudo. See
   [Supported hosts](#supported-hosts).
 - Membership in the `libvirt` and `kvm` groups. The bootstrap adds you; log in again after it does.
-- For the GitHub scenarios: the private repositories in `ansible/vars/gateway.yml` `github_repos`
-  (`infrashift/private-scratch-1`, `-2` and `-3`), each holding at least one file (a README). For
+- For the GitHub scenarios: the private repositories of the `github-pat` entries in
+  `ansible/vars/gateway-secrets.yml` (`infrashift/private-scratch-1`, `-2` and `-3`), each holding at least one file (a README). For
   **each** repository, a fine-grained PAT limited to it alone: Repository access "Only select
   repositories" with just that one, and the permissions Contents and Metadata, read-only. The resource
   owner is the organisation, which may have to approve the PAT. For GitHub's hosted MCP server, the
@@ -149,19 +150,22 @@ Make sure that you have these items:
 
 ## Procedure 4: Load the real credentials
 
-Do this once, and again to rotate a credential. The credentials are kept ansible-vault encrypted in
-`ansible/inventory-host/host_vars/localhost/vault.yml`, which Git ignores, and the gateway playbook
-writes them into Vault. See [Gateway Credentials in the Host Inventory](../../.okfw/concepts/gateway-credentials-in-the-host-inventory--01a17e133adc.md).
+Do this once, and again to rotate a credential. The registry `ansible/vars/gateway-secrets.yml`
+(committed) names each credential, its kind and repository, and when it was rotated and expires. The
+values are kept ansible-vault encrypted in `ansible/inventory-host/host_vars/localhost/vault.yml`,
+which Git ignores, and the gateway playbook writes them into Vault. See [Gateway Credentials in the Host Inventory](../../.okfw/concepts/gateway-credentials-in-the-host-inventory--01a17e133adc.md).
 
 1. Run this command, and type each value at its prompt: each repository's PAT, then the Anthropic API
    key. The terminal does not show what you type:
 
    ```sh
-   make -f lab-gateway.mk secrets
+   make -f lab-gateway.mk secret-set
    ```
 
-   > **Note:** To set or rotate only one, add `NAME=private-scratch-2` (a key of `github_repos`) or
-   > `NAME=anthropic`.
+   > **Note:** To set only one, add `NAME=private-scratch-2` (a registry name) or `NAME=anthropic`.
+   > To rotate one later and record its new expiry date, run
+   > `make -f lab-gateway.mk secret-rotate NAME=<name>`. `make -f lab-gateway.mk secrets-list` shows
+   > what is held, when it was loaded and when it expires.
 
 2. The command then runs the gateway playbook for Vault. Read the dry run and type `yes`. The playbook
    checks that each PAT reads its private repository and that the Anthropic key works. If one does not,
@@ -237,11 +241,12 @@ writes them into Vault. See [Gateway Credentials in the Host Inventory](../../.o
 > **Note:** Do this after procedure 8 and procedure 4. The tests run on the sandbox VM as `dev`, with
 > the surrogate credentials only, and change nothing.
 
-1. For the SCP scenario, allow the SCP target through the tunnel, and renew the agent certificate if it
-   is older than 8 hours:
+1. For the SCP scenario, the SCP target is allowed through the tunnel by the `ssh` entry of
+   `ansible/vars/egress-allow.yml`. Make sure Consul matches the file, and renew the agent
+   certificate if it is older than 8 hours:
 
    ```sh
-   make -f lab-gateway.mk allow HOST=192.168.151.10:22 REASON="scenario 4: scp to upstream-1"
+   make -f lab-gateway.mk allow-plan          # "Consul's allow list matches the file."; else allow-sync
    make -f lab-gateway.mk agent-cert
    ```
 
@@ -258,25 +263,42 @@ writes them into Vault. See [Gateway Credentials in the Host Inventory](../../.o
 
 ## Daily operation
 
+`lab-sandbox-ops.mk` gathers the recurring tasks in one place; each target runs the one in
+`lab-gateway.mk`, `lab-provision.mk` or a verify suite. `make -f lab-sandbox-ops.mk` lists them by
+section. See the wiki runbook
+[Operate the Sandbox (Day 2)](../../.okfw/runbooks/operate-the-sandbox-day-2--01a1a3594f4a.md).
+
 | Task | Command |
 |---|---|
-| Show the state and the IP address of each lab VM. | `make -f lab-provision.mk status` |
-| Connect to a lab VM as `dev`. | `make -f lab-provision.mk ssh` |
-| Connect to a lab VM as `admin`, the user with sudo. | `make -f lab-provision.mk ssh ROLE=admin` |
-| Stop the lab VMs. | `make -f lab-provision.mk stop` |
-| Start the lab VMs, for example after the host restarts. | `make -f lab-provision.mk start` |
+| One screen: VMs, gateway services, agent certificate, allow-list drift, secrets. | `make -f lab-sandbox-ops.mk status` |
+| After the host restarts: check the gateway, start the VMs, renew the agent certificate. | `make -f lab-sandbox-ops.mk up` |
+| Stop the lab VMs. | `make -f lab-sandbox-ops.mk down` |
+| Connect to the sandbox as `dev` (renews the agent certificate when under 1 hour is left). | `make -f lab-sandbox-ops.mk ssh` |
+| Connect to a lab VM as `admin`, the user with sudo. | `make -f lab-sandbox-ops.mk ssh ROLE=admin` |
+| List the egress allow list, with any drift between the file and Consul. | `make -f lab-sandbox-ops.mk allow-list` |
+| Allow a site for the sandbox (optionally until a date). | `make -f lab-sandbox-ops.mk allow HOST=example.com:443 REASON="why" [EXPIRES=YYYY-MM-DD]` |
+| Allow a TCP service. Only a client that speaks HTTP CONNECT, or one wrapped in `ncat --proxy`, can use it. | `make -f lab-sandbox-ops.mk allow HOST=db.example.com:5432 REASON="why"` |
+| Allow an SSH target for a login (adds the login to the agent certificate). | `make -f lab-sandbox-ops.mk allow HOST=git.example.com:22 USER=git REASON="why"` |
+| Remove a site that you allowed. | `make -f lab-sandbox-ops.mk deny HOST=example.com:443` |
+| After editing `ansible/vars/egress-allow.yml` by hand, or a pull: show and apply the difference. | `make -f lab-sandbox-ops.mk allow-plan`, then `allow-sync` |
+| What the tunnel refused (candidates for the allow list). | `make -f lab-sandbox-ops.mk denied [SINCE=24h]` |
+| List the real credentials: held, loaded, rotated, expiring. | `make -f lab-sandbox-ops.mk secrets-list` |
+| Rotate a credential and record its new expiry. | `make -f lab-sandbox-ops.mk secret-rotate NAME=private-scratch-1` |
+| Add a repository. | `make -f lab-sandbox-ops.mk secret-add NAME=<name> KIND=github-pat REPO=<owner/name>`, then its surrogates in `ansible/vars/gateway.yml` |
+| Renew the sandbox ssh-agent's certificate (it lasts 8 hours). | `make -f lab-sandbox-ops.mk agent-cert` |
+| Review break-glass use. | `make -f lab-sandbox-ops.mk audit [SINCE=7d]` |
 | Apply the guest playbooks again. | `make -f lab-provision.mk ansible` |
 | Delete the lab VMs. The base images stay in `/var/lib/ai-sandbox/images`. | `make -f lab-provision.mk destroy` |
-| List the egress allow list. | `make -f lab-gateway.mk allowlist` |
-| Allow a site for the sandbox. | `make -f lab-gateway.mk allow HOST=example.com:443 REASON="why"` |
-| Remove a site that you allowed. | `make -f lab-gateway.mk deny HOST=example.com:443` |
-| Renew the sandbox ssh-agent's certificate (it lasts 8 hours). | `make -f lab-gateway.mk agent-cert` |
+
+The allow list and the secrets registry are committed files: `allow`, `deny` and the `secret-*`
+targets edit them, so commit after a change.
 
 To operate on one lab VM only, add `VM=<name>`, for example `VM=fedora-dev-1`.
 
 To see all the targets of each makefile, run these commands:
 
 ```sh
+make -f lab-sandbox-ops.mk help
 make -f lab-bootstrap.mk help
 make -f lab-bootstrap-verify.mk help
 make -f lab-gateway.mk help

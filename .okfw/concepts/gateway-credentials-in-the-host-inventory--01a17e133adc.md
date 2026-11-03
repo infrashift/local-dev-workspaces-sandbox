@@ -25,18 +25,22 @@ never passed through Ansible.
 
 | File | Holds | In Git |
 |---|---|---|
-| `inventory-host/host_vars/localhost/vars.yml` | `gateway_secrets`: secret name → `"{{ <name>_secret }}"` | yes (no secret) |
-| `inventory-host/host_vars/localhost/vault.yml` | each `<name>_secret`, as its own `!vault` block (the lab's `.ansible_vault_key`) | no (gitignored, 0600) |
-| `vars/gateway.yml` | `github_repos` (secret name → `owner/name`) and the surrogates, each naming its `secret` and, for GitHub, its `repo` | yes |
+| `vars/gateway-secrets.yml` | the registry: each secret's name, kind, repository, `vault_var`, rotated and expires dates; `github_repos` derives from it ([Gateway Secrets Registry](/concepts/gateway-secrets-registry--01a1a358cacd.md), since 2026-11-03) | yes (no secret) |
+| `inventory-host/host_vars/localhost/vault.yml` | each `vault_var`, as its own `!vault` block (the lab's `.ansible_vault_key`) | no (gitignored, 0600) |
+| `vars/gateway.yml` | the surrogates, each naming its `secret` and, for GitHub, its `repo` | yes |
 
-`make -f lab-gateway.mk secrets [NAME=<name>]` reads a secret at a hidden prompt and pipes it into
+Until 2026-11-03, `github_repos` lived in `vars/gateway.yml` and `gateway_secrets` (name →
+`"{{ <var> }}"`) in `inventory-host/host_vars/localhost/vars.yml`; `gateway-host.yml` now derives
+`gateway_secrets` from the registry.
+
+`make -f lab-gateway.mk secret-set [NAME=<name>]` (formerly `secrets`) reads a secret at a hidden prompt and pipes it into
 `ansible-vault encrypt_string`. It replaces that variable's block in `vault.yml`, then runs the gateway
 playbook with `TAGS=vault`: a dry run, then "yes". With no `NAME`, it asks for each secret `vault.yml`
 lacks.
 
 ## One fine-grained PAT per repository
 
-Each repository in `github_repos` has its **own** fine-grained PAT, limited to that one repository, and
+Each repository in `github_repos` (the registry's `github-pat` entries) has its **own** fine-grained PAT, limited to that one repository, and
 its own three surrogates (`use: git`, `api`, `mcp`), each bound to it with `repo:`. Envoy's Lua filter
 refuses a repository-bound surrogate on another repository's path (403 "surrogate repository mismatch").
 It finds the repository with the route's `repo_path` pattern: `/<owner>/<repo>` on github.com and
@@ -63,7 +67,7 @@ the MCP call, which Envoy does not parse.
 - Then one record per surrogate (hosts, repository, header, value), and the deletion of any record that
   no surrogate names. Every task that holds a value is `no_log`, and every message names secrets, never
   values.
-- A missing variable stops the run first, by name: `'github_pat_private_scratch_2_secret' is undefined`.
+- A missing variable stops the run first, by registry name (the `varnames` check in `gateway-host.yml`), before any value is decrypted.
 
 The operator token is now **read-only** on the records. Only the playbook, with the root token, writes
 them.
@@ -95,11 +99,12 @@ them.
 - Not yet: the sandbox suite, which needs the lab VMs.
 
 ## Related
+- [Gateway Secrets Registry](/concepts/gateway-secrets-registry--01a1a358cacd.md)
 - [GitHub MCP Servers Behind the Gateway](/concepts/github-mcp-servers-behind-the-gateway--01a17de05379.md)
 - [Provision and Verify the Gateway](/runbooks/provision-and-verify-the-gateway--01a170011e5c.md)
 - [Gateway Separated from the Host Bootstrap](/concepts/gateway-separated-from-the-host-bootstrap--01a17000956a.md)
 
 ## Source
-- `labs/fedora44min-x86_64-dev-ws/ansible/inventory-host/host_vars/localhost/vars.yml`, `ansible/vars/gateway.yml`, `ansible/playbooks/gateway-host.yml`
+- `labs/fedora44min-x86_64-dev-ws/ansible/vars/gateway-secrets.yml`, `ansible/vars/gateway.yml`, `ansible/playbooks/gateway-host.yml`
 - `scripts/gateway/sandbox-secret.sh`, `ansible/roles/gateway/vault_gateway/`, `ansible/roles/gateway/envoy_gateway/templates/surrogate.lua.j2`
 - `labs/fedora44min-x86_64-dev-ws/tests/gateway/test_credentials.py`

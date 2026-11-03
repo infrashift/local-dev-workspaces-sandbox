@@ -105,8 +105,9 @@ HOST_INVENTORY := $(LAB_DIR)/ansible/inventory-host
 BECOME_VAULT   := $(HOST_INVENTORY)/host_vars/localhost/become.vault.yml
 VAULT_KEY      := $(PROJECT_ROOT)/.ansible_vault_key
 # The gateway's real credentials (GitHub PATs, the Anthropic API key): their
-# names in vars.yml (committed), their values ansible-vault encrypted in
-# vault.yml (gitignored), set with: make -f lab-gateway.mk secrets
+# names in the registry ansible/vars/gateway-secrets.yml (committed), their
+# values ansible-vault encrypted in vault.yml (gitignored), set with:
+# make -f lab-gateway.mk secret-set
 CREDENTIALS_VARS  := $(HOST_INVENTORY)/host_vars/localhost/vars.yml
 CREDENTIALS_VAULT := $(HOST_INVENTORY)/host_vars/localhost/vault.yml
 

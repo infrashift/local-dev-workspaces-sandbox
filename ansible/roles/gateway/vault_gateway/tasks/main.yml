@@ -10,8 +10,8 @@
 #                        (and so Envoy) may read
 #   an operator token    (OPERATOR_DIR, 0600): reads the surrogate records,
 #                        signs SSH certificates; never handed to a guest
-# The real credentials come from the host inventory (vars.yml gateway_secrets,
-# encrypted in vault.yml; make -f lab-gateway.mk secrets). Each is checked
+# The real credentials come from the host inventory's vault.yml, by the names
+# of the registry vars/gateway-secrets.yml (make -f lab-gateway.mk secret-set). Each is checked
 # against its service first: a GitHub PAT must belong to someone and read its
 # private repository, the Anthropic key must list the models. Every task that
 # touches one is no_log.
@@ -62,7 +62,9 @@
       - >-
         vault_gateway_github_repos.values() | map(attribute='repo', default='')
         | reject('match', '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') | list | length == 0
-      - vault_gateway_scp_user is defined and vault_gateway_scp_user is match('^[a-z][a-z0-9-]*$')
+      - vault_gateway_ssh_principals is defined and vault_gateway_ssh_principals is sequence
+      - vault_gateway_ssh_principals is not string and vault_gateway_ssh_principals | length > 0
+      - vault_gateway_ssh_principals | reject('match', '^[a-z][a-z0-9-]*$') | list | length == 0
     fail_msg: >-
       A required role parameter was not supplied. This role has NO defaults by
       design — the playbook must pass each one:
@@ -72,10 +74,10 @@
         vault_gateway_operator_dir     absolute directory for the operator token (OPERATOR_DIR)
         vault_gateway_surrogates       vars/gateway.yml surrogates: {name: {credential, scheme
                                        (basic|bearer|x-api-key), target_hosts, repo, secret}}
-        vault_gateway_secrets          {secret name: the real credential} (host inventory
-                                       gateway_secrets, from vault.yml)
-        vault_gateway_github_repos     vars/gateway.yml github_repos: {secret name: {repo: owner/name}}
-        vault_gateway_scp_user         the SCP target's user, the SSH certificate principal
+        vault_gateway_secrets          {secret name: the real credential} (gateway-host.yml
+                                       gateway_secrets: the registry's names, vault.yml's values)
+        vault_gateway_github_repos     vars/gateway-secrets.yml github_repos: {secret name: {repo: owner/name}}
+        vault_gateway_ssh_principals   the ssh users of the egress allow file: the certificate's principals
     quiet: true
 
 - name: Show the requested parameters
@@ -354,14 +356,43 @@
       changed_when: true
       when: not ansible_check_mode and vault_gateway_ssh_ca.status != 200
 
-    - name: Ensure the SSH role for the SCP target
+    - name: Ensure the SSH role the sandbox agent's certificate is signed under
       ansible.builtin.include_tasks: ensure.yml
       vars:
         vault_gateway_object:
-          path: "{{ vault_gateway_ssh_mount }}/roles/{{ vault_gateway_scp_user }}"
+          path: "{{ vault_gateway_ssh_mount }}/roles/{{ vault_gateway_ssh_role }}"
           data: "{{ vault_gateway_ssh_role_config }}"
           kv: false
           secret: false
+
+    # Any other role (scp-target, before the principals came from the allow
+    # file) would still sign: remove it.
+    - name: List the SSH roles
+      ansible.builtin.uri:
+        url: "{{ vault_gateway_url }}/v1/{{ vault_gateway_ssh_mount }}/roles?list=true"
+        unix_socket: "{{ vault_gateway_socket }}"
+        headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+        status_code: [200, 404]
+      register: vault_gateway_ssh_roles
+      check_mode: false
+
+    - name: Would remove a stale SSH role
+      ansible.builtin.debug:
+        msg: "{{ vault_gateway_ssh_mount }}/roles/{{ item }}"
+      changed_when: true
+      loop: "{{ vault_gateway_ssh_stale_roles }}"
+      when: ansible_check_mode
+
+    - name: Remove a stale SSH role
+      ansible.builtin.uri:
+        url: "{{ vault_gateway_url }}/v1/{{ vault_gateway_ssh_mount }}/roles/{{ item }}"
+        unix_socket: "{{ vault_gateway_socket }}"
+        method: DELETE
+        headers: { X-Vault-Token: "{{ vault_gateway_root_token }}" }
+        status_code: [204]
+      changed_when: true
+      loop: "{{ vault_gateway_ssh_stale_roles }}"
+      when: not ansible_check_mode
 
     # One record per surrogate, in its scheme's form (basic carries the login
     # GitHub reported for the PAT), and the same binding without the secret in

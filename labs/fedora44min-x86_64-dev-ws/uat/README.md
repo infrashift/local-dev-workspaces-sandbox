@@ -88,8 +88,9 @@ Remove what the tests left on the lab, unless you want to keep it:
 
 1. As dev: `rm -rf ~/uat-py ~/uat-git` and
    `podman rmi localhost/uat-py ghcr.io/astral-sh/uv:python3.14-trixie-slim`.
-2. As the operator: if no one needs SCP now, `make -f lab-gateway.mk deny HOST=192.168.151.10:22`.
-   Then `make -f lab-gateway.mk allowlist | grep -w operator` shows only the entries that someone
-   needs.
+2. As the operator: `make -f lab-gateway.mk allow-list | grep -w operator` shows only the entries of
+   `ansible/vars/egress-allow.yml`, and `git diff ansible/vars/egress-allow.yml` shows nothing. Keep
+   the `192.168.151.10:22` entry: it is committed, and its `scp-target` user is the sandbox agent
+   certificate's principal.
 3. As the operator: run `make -f lab-provision-verify.mk STACK=python-stack` and
    `make -f lab-gateway-verify.mk`. Both pass.

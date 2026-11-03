@@ -235,6 +235,16 @@ def vars_file(name: str) -> dict[str, Any]:
     return _yaml(lab().lab_dir / "ansible" / "vars" / name)
 
 
+def secret_registry() -> dict[str, dict[str, Any]]:
+    """The gateway's real credentials by name (vars/gateway-secrets.yml): kind, repo, vault_var, dates."""
+    return vars_file("gateway-secrets.yml")["gateway_secret_registry"]
+
+
+def github_repos() -> dict[str, dict[str, Any]]:
+    """The registry's github-pat entries, as the playbooks derive github_repos: {secret name: {repo, ...}}."""
+    return {name: spec for name, spec in secret_registry().items() if spec["kind"] == "github-pat"}
+
+
 # ---------------------------------------------------------------------------
 # Certificates (the PEM chains ca_trust and the gateway read)
 # ---------------------------------------------------------------------------

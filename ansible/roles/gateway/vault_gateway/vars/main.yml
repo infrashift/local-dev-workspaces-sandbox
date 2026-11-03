@@ -8,6 +8,9 @@
 vault_gateway_url: http://localhost
 vault_gateway_kv_mount: ai-sandbox
 vault_gateway_ssh_mount: ssh-sandbox
+# The one SSH role the sandbox ssh-agent's certificate is signed under; its
+# principals are the ssh users of the egress allow file (vault_gateway_ssh_principals).
+vault_gateway_ssh_role: sandbox-egress
 vault_gateway_approle: envoy-gateway
 vault_gateway_reader_policy: envoy-surrogate-reader
 vault_gateway_operator_policy: ai-sandbox-operator
@@ -50,7 +53,7 @@ vault_gateway_policies:
       path "{{ vault_gateway_kv_mount }}/metadata/surrogates" {
         capabilities = ["list"]
       }
-      path "{{ vault_gateway_ssh_mount }}/sign/{{ vault_gateway_scp_user }}" {
+      path "{{ vault_gateway_ssh_mount }}/sign/{{ vault_gateway_ssh_role }}" {
         capabilities = ["update"]
       }
   - name: "{{ vault_gateway_break_glass_policy }}"
@@ -75,11 +78,15 @@ vault_gateway_approle_config:
   token_max_ttl: 14400
   secret_id_ttl: 0
   bind_secret_id: true
+# SSH roles Vault holds besides vault_gateway_ssh_role (read by tasks/main.yml).
+vault_gateway_ssh_stale_roles: >-
+  {{ (vault_gateway_ssh_roles.json.data['keys'] | default([]) if vault_gateway_ssh_roles.status == 200 else [])
+     | reject('eq', vault_gateway_ssh_role) | list }}
 vault_gateway_ssh_role_config:
   key_type: ca
   allow_user_certificates: true
-  allowed_users: "{{ vault_gateway_scp_user }}"
-  default_user: "{{ vault_gateway_scp_user }}"
+  allowed_users: "{{ vault_gateway_ssh_principals | sort | join(',') }}"
+  default_user: "{{ vault_gateway_ssh_principals | sort | first }}"
   allowed_extensions: permit-pty
   default_extensions: { permit-pty: "" }
   ttl: 28800

@@ -64,16 +64,12 @@ gateway_routes:
     upstream:
       { address: 192.168.151.10, port: 8443, sni: mcp.upstream.ai-sandbox.test, ca: upstream, host_rewrite: localhost }
 
-# The private GitHub repositories the sandbox may use. Each has its OWN
-# fine-grained PAT, limited to that one repository: the key is the PAT's
-# secret name in the host inventory (inventory-host/host_vars/localhost/
-# vars.yml gateway_secrets, encrypted in vault.yml; make -f lab-gateway.mk
-# secrets NAME=<key>). To add a repository: an entry here, its three
-# surrogates below, and its secret.
-github_repos:
-  private-scratch-1: { repo: infrashift/private-scratch-1 }
-  private-scratch-2: { repo: infrashift/private-scratch-2 }
-  private-scratch-3: { repo: infrashift/private-scratch-3 }
+# The private GitHub repositories the sandbox may use are the github-pat
+# entries of vars/gateway-secrets.yml (github_repos there). Each has its OWN
+# fine-grained PAT, limited to that one repository. To add a repository:
+#   make -f lab-gateway.mk secret-add NAME=<key> KIND=github-pat REPO=<owner/name>
+# which adds its registry line, asks for the PAT, and prints the three
+# surrogates (git, api, mcp) to add below.
 
 # Surrogates: NON-secret credentials the guest holds. Each is bound to the
 # hosts it may be presented to, and a GitHub one to its repository; Envoy
@@ -92,8 +88,8 @@ github_repos:
 #                 call GitHub with the PAT themselves), anthropic
 #   target_hosts: gateway_routes hosts this surrogate is valid for (anti-replay)
 #   repo:         the one repository a GitHub surrogate is valid for
-#   secret:       the real credential behind it: a github_repos key (that
-#                 repository's PAT) or anthropic (the API key)
+#   secret:       the real credential behind it: a gateway-secrets.yml name
+#                 (a repository's PAT, or anthropic: the API key)
 surrogates:
   github_git_scratch_1:
     credential: "claude:surrogate-github-git-scratch-1"
@@ -168,7 +164,8 @@ surrogates:
     target_hosts: [api.anthropic.com]
     secret: anthropic
 
-# The SCP target's account (scenario 4) and the principal the Vault SSH CA
-# signs the sandbox agent's certificate for.
+# The SCP target's account on upstream-1 (scenario 4; upstream.yml). The
+# sandbox agent's certificate principals are the ssh users of
+# vars/egress-allow.yml, whose scenario 4 entry names this account.
 scp_target_user: scp-target
 ...

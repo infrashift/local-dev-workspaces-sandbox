@@ -181,7 +181,8 @@ def test_scp_reaches_the_target_with_the_forwarded_agent(dev):
     )
     assert result.rc == 0, (
         f"scp from {user}@{target}: {result.stderr.strip()[-300:]}. The tunnel needs an allow-list entry "
-        f'({GATEWAY} allow HOST={target}:22 REASON="scenario 4") and a fresh agent certificate ({GATEWAY} agent-cert)'
+        f'({GATEWAY} allow HOST={target}:22 USER={user} REASON="scenario 4") and a fresh agent certificate '
+        f"({GATEWAY} agent-cert)"
     )
 
 

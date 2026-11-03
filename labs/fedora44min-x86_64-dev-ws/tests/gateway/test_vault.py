@@ -21,7 +21,7 @@ KV = gw.role_vars("vault_gateway")["vault_gateway_kv_mount"]
 SSH = gw.role_vars("vault_gateway")["vault_gateway_ssh_mount"]
 APPROLE = gw.role_vars("vault_gateway")["vault_gateway_approle"]
 OPERATOR_POLICY = gw.role_vars("vault_gateway")["vault_gateway_operator_policy"]
-SCP_USER = gw.GATEWAY_VARS["scp_target_user"]
+SSH_ROLE = gw.role_vars("vault_gateway")["vault_gateway_ssh_role"]
 SOCKET = gw.PINS["vault_socket"]
 SOCKET_GROUP = gw.PINS["vault_socket_group"]
 # Where Vault listened before the unix-socket change: its API and cluster ports.
@@ -77,7 +77,8 @@ CAPABILITIES = {
     f"{KV}/metadata/surrogates/probe": ["read"],
     f"{KV}/metadata/surrogates": ["list"],
     f"{KV}/data/fixtures/probe": ["deny"],
-    f"{SSH}/sign/{SCP_USER}": ["update"],
+    f"{SSH}/sign/{SSH_ROLE}": ["update"],
+    f"{SSH}/sign/scp-target": ["deny"],
     f"{SSH}/sign/root": ["deny"],
     f"{KV}/data/other": ["deny"],
     "sys/policy/probe": ["deny"],

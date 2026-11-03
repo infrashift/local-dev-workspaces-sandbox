@@ -21,6 +21,8 @@
   vars_files:
     - ../vars/gateway.yml
     - ../vars/egress-baseline.yml
+    - ../vars/egress-allow.yml
+    - ../vars/gateway-secrets.yml
 
   vars:
     vault_version: "2.2.1"
@@ -63,8 +65,21 @@
       - source-hosts
       - oci-registries
       - claude
+    # The real credentials, by registry name (vars/gateway-secrets.yml), from
+    # the host inventory's vault.yml. Lazy: a value is decrypted only where it
+    # is used.
+    gateway_secrets: >-
+      {{ dict(gateway_secret_registry.keys()
+              | zip(query('ansible.builtin.vars', *(gateway_secret_registry.values() | map(attribute='vault_var'))))) }}
+    # Warn this many days before a registry entry's expires date.
+    secret_expiry_warn_days: 14
     # The sandbox ssh-agent's certificate lifetime (scenario 4).
     agent_cert_ttl: 8h
+    # Its principals: the ssh users of the egress allow file (vars/egress-allow.yml;
+    # concepts/SSH Agent Forwarding). The allow entries themselves are the
+    # operator's (make -f lab-gateway.mk allow-sync); only the users come here.
+    ssh_principals: >-
+      {{ egress_allow | default([], true) | selectattr('kind', 'eq', 'ssh') | map(attribute='user') | unique | sort }}
 
   pre_tasks:
     - name: Assert lab-gateway.mk passed the lab values
@@ -84,9 +99,99 @@
         quiet: true
       tags: [always]
 
-    # The real credentials (host_vars/localhost: vars.yml names them, vault.yml
-    # holds them encrypted). Rendering gateway_secrets fails on the first
-    # one vault.yml lacks; that name, never a value, is what is reported.
+    - name: Assert the egress allow file names at least one ssh user
+      ansible.builtin.assert:
+        that: ssh_principals | length > 0
+        fail_msg: >-
+          vars/egress-allow.yml has no kind: ssh entry, so the sandbox ssh-agent's
+          certificate would have no principal. Add one (make -f lab-gateway.mk allow
+          HOST=<host>:22 USER=<user> REASON=...), or keep the scenario 4 entry.
+        quiet: true
+      tags: [vault, ssh_agent]
+
+    # The registry and the surrogates must agree before anything is written
+    # (scripts/gateway/secrets_check.py applies the same rules for secrets-check).
+    - name: Assert the secrets registry and the surrogates agree
+      ansible.builtin.assert:
+        that:
+          - gateway_secret_registry is mapping and gateway_secret_registry | length > 0
+          - >-
+            gateway_secret_registry.values() | map(attribute='kind', default='')
+            | reject('in', ['github-pat', 'anthropic-api-key']) | list | length == 0
+          - >-
+            gateway_secret_registry.values() | map(attribute='vault_var', default='')
+            | reject('match', '^[a-z][a-z0-9_]*_secret$') | list | length == 0
+          - >-
+            github_repos.values() | map(attribute='repo', default='')
+            | reject('match', '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') | list | length == 0
+          # Every surrogate names a registry entry, and a GitHub one its entry's repository.
+          - >-
+            surrogates.values() | map(attribute='secret')
+            | reject('in', gateway_secret_registry.keys() | list) | list | length == 0
+          - >-
+            surrogates.values() | selectattr('repo', 'defined')
+            | rejectattr('secret', 'in', github_repos.keys() | list) | list | length == 0
+          - >-
+            surrogates.values() | selectattr('repo', 'defined')
+            | rejectattr('repo', 'in', github_repos.values() | map(attribute='repo') | list) | list | length == 0
+          # Every registry entry is used by at least one surrogate.
+          - >-
+            gateway_secret_registry.keys()
+            | difference(surrogates.values() | map(attribute='secret') | list) | length == 0
+        fail_msg: >-
+          vars/gateway-secrets.yml and vars/gateway.yml's surrogates disagree. Details:
+          make -f lab-gateway.mk secrets-check
+        quiet: true
+      tags: [always]
+
+    - name: Find registry entries past, or near, their expiry date
+      ansible.builtin.set_fact:
+        gateway_secrets_expired: "{{ _pairs | selectattr('1', 'le', _today) | map('first') | list }}"
+        gateway_secrets_expiring: >-
+          {{ _pairs | selectattr('1', 'gt', _today) | selectattr('1', 'le', _soon) | map('first') | list }}
+      vars:
+        # [name, expires as YYYY-MM-DD] for the entries that have a date; ISO dates compare as strings.
+        _dated: "{{ gateway_secret_registry | dict2items | selectattr('value.expires', 'defined') }}"
+        _pairs: >-
+          {{ _dated | map(attribute='key') | zip(_dated | map(attribute='value.expires') | map('string')) | list }}
+        _today: "{{ now().strftime('%Y-%m-%d') }}"
+        _soon: "{{ '%Y-%m-%d' | strftime(now().timestamp() + (secret_expiry_warn_days | int) * 86400) }}"
+      tags: [vault]
+
+    - name: Warn about secrets that expire soon
+      ansible.builtin.debug:
+        msg: >-
+          {{ gateway_secrets_expiring | join(', ') }} expire(s) within {{ secret_expiry_warn_days }} days:
+          make -f lab-gateway.mk secret-rotate NAME=<name>
+      when: gateway_secrets_expiring | length > 0
+      tags: [vault]
+
+    - name: Fail on a secret past its expiry date
+      ansible.builtin.fail:
+        msg: >-
+          {{ gateway_secrets_expired | join(', ') }} expired (vars/gateway-secrets.yml expires):
+          make -f lab-gateway.mk secret-rotate NAME=<name>
+      when: gateway_secrets_expired | length > 0
+      tags: [vault]
+
+    # Names only: which registry variables vault.yml lacks.
+    - name: Assert vault.yml holds every registry secret
+      ansible.builtin.assert:
+        that: gateway_secrets_missing | length == 0
+        fail_msg: >-
+          The host inventory's vault.yml lacks {{ gateway_secrets_missing | join(', ') }}:
+          make -f lab-gateway.mk secret-set NAME=<name>
+        quiet: true
+      vars:
+        gateway_secrets_missing: >-
+          {{ gateway_secret_registry | dict2items
+             | rejectattr('value.vault_var', 'in', query('ansible.builtin.varnames', '^[a-z][a-z0-9_]*_secret$'))
+             | map(attribute='key') | list }}
+      tags: [vault]
+
+    # The values decrypt (a wrong vault key fails here). Rendering
+    # gateway_secrets fails on the first one that does not; that name, never
+    # a value, is what is reported.
     - name: Check that vault.yml holds every gateway secret
       tags: [vault]
       block:
@@ -99,9 +204,10 @@
         - name: Report the missing secret
           ansible.builtin.fail:
             msg: >-
-              {{ ansible_failed_result.msg | regex_search("'[a-z0-9_]+' is undefined")
-                 | default('A gateway secret is missing', true) }}
-              in the host inventory's vault.yml: make -f lab-gateway.mk secrets
+              {{ ansible_failed_result.msg
+                 | regex_search("'[a-z0-9_]+' (is undefined|was not found)|named '[a-z0-9_]+'")
+                 | default('A gateway secret does not decrypt', true) }}
+              in the host inventory's vault.yml: make -f lab-gateway.mk secret-set NAME=<name>
 
   roles:
     - role: hashicorp_release
@@ -164,7 +270,7 @@
       vault_gateway_surrogates: "{{ surrogates }}"
       vault_gateway_secrets: "{{ gateway_secrets }}"
       vault_gateway_github_repos: "{{ github_repos }}"
-      vault_gateway_scp_user: "{{ scp_target_user }}"
+      vault_gateway_ssh_principals: "{{ ssh_principals }}"
       tags: [vault]
 
     - role: vault_proxy
@@ -228,8 +334,9 @@
       sandbox_ssh_agent_socket: "{{ sandbox_agent_sock }}"
       sandbox_ssh_agent_vault_socket: "{{ vault_socket }}"
       sandbox_ssh_agent_operator_dir: "{{ operator_dir }}"
-      sandbox_ssh_agent_principal: "{{ scp_target_user }}"
+      sandbox_ssh_agent_principals: "{{ ssh_principals }}"
       sandbox_ssh_agent_ttl: "{{ agent_cert_ttl }}"
       sandbox_ssh_agent_ssh_mount: ssh-sandbox
+      sandbox_ssh_agent_ssh_role: sandbox-egress
       tags: [ssh_agent]
 ...
